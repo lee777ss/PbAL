@@ -1,0 +1,3829 @@
+---
+title: "Nonparametric Logistic regression"
+author: "Wonjae Lee"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+# 1. Setting 
+
+## 1.1 Library
+```{r}
+library('readr')
+library('dplyr')
+library('mgcv')
+library('ggplot2')
+library('caret')
+library(doBy) # which.minn
+library(unbalanced) # TOMEK, NCL, SMOTE
+library(yarr)
+library(ebmc) # SMOTEBoost
+library(imbalance)
+library(multcompView) # Tukey test
+library(agricolae) # Fisher's LSD
+library(rpart) # decision tree
+library(e1071) # SVM
+library(caret) # For confusionMatrix
+library(PRROC) # For pr.curve and roc.curve
+
+data.selection = 12
+  z = 1 # z = 1 (dat1), =2 (dat2), .... = 5 (dat5)
+
+bs.in = c("tp", "cr")[2]
+k.num = 10 # hyper-parameter k-knots in s() of gam()
+
+# select the weight only when selecting samples
+weight.selection = 1 # applying weight when selection (e.g., margin, optimality) weight.selection = 1 (apply weight), = 2 (no apply)
+weight.gam.perf = 2 # applying weight when measuring GAM performance
+weight.rand.perf = 2 # applying weight when measuring Random performance
+
+
+gam.selection = 4 # gam.selection = 1 (gam with prob), =2 (glm), =3 (gam with optimal), =4 (gam with perf), =5 (decision tree), =6 (SVM)
+
+  margin.selection = 1 # margin.selection = 1 (gam with margin), =2 (gam with prediction variance)
+  opt.selection = 1 # opt.selection = 1 (margin + optimal), =2 (random + optimal), = 3 (decision tree, SVM)
+  DAE.selection = 2 # DAE.selection = 1 (D-optimal), =2 (A-optimal), =3 (E-optimal)
+  perf.selection= 1 # perf.selection = 1 (f-measure), =2 (g-mean)
+
+rand.selection = 1  # rand.selection = 1 (GAM), =2 (GLM), =3 (skip random selection)
+
+x_sel = 100 # the number of candidates
+k = 5 # k-fold CV
+initial_k = 10 # starting number of instances in training set
+my.seed = 1 # seed number
+repeats = 20 # the number of instances selected by active learning with initial set
+length = 20 # the number of instances to plot
+
+
+```
+
+# mgcv
+
+## mgcv::gam() function parameters
+  . family: distribution families (e.g., "binomial")
+
+## s() function parameters
+ . s() is only use in gam() function for smoothing spilne
+ . fx = FALSE: a penalized regression spline (default)
+   fx = TRUE: a fixed d.f. regression spline
+ . bs = "tp": thin-plate regression spline (default)
+   bs = bs.in: cubic regression spline
+ . m = 2: the order of the penalty (i.e., 2nd derivatives)
+ . k = 10: basis complexity, the dimension of the basis (knot points), hyper-parameter, the higher the number, the more the overfitting is.
+ . sp: smoothing parameter (lambda)
+   
+```{r}
+library(mgcv)
+set.seed(2) ## simulate some data... 
+dat <- gamSim(1,n=400,dist="normal",scale=2)
+b <- gam(y~s(x0, k=20)+s(x1)+s(x2)+s(x3),data=dat, method = "REML")
+
+pred = predict(b, se.fit = TRUE)
+summary(b)
+sp.vcov(b) # only availble for REML or ML
+
+
+plot(b,pages=1,residuals=TRUE)  ## show partial residuals
+plot(b,pages=1,seWithMean=TRUE) ## `with intercept' CIs
+## run some basic model checks, including checking
+## smoothing basis dimensions...
+gam.check(b)
+
+## same fit in two parts .....
+G <- gam(y~s(x0)+s(x1)+s(x2)+s(x3),fit=FALSE,data=dat)
+b <- gam(G=G)
+print(b)
+```
+```{r}
+require(mgcv)
+set.seed(2) ## simulate some data...
+dat <- gamSim(1,n=400,dist="normal",scale=2)
+b <- gam(y~s(x0)+s(x1)+s(x2)+s(x3),data=dat,method="REML")
+b
+sp.vcov(b)
+```
+
+
+### sp.vcov {mgcv}
+spline variance-covariance matrix
+Extract smoothing parameter estimator covariance matrix from "(RE)ML" GAM fit
+
+### vcov {stats}
+variance-covariance matrix
+Calculate Variance-Covariance Matrix for a Fitted Model Object
+```{r}
+require(mgcv)
+set.seed(1)
+
+n <- 100
+x <- runif(n);
+z <- runif(n)
+int <- sample(1, n, replace = TRUE)
+y <- sin(x*2*pi) + rnorm(n)*.2
+# mod <- gam(y ~ s(x,bs="cc",k=10) + s(z), knots=list(x=seq(0,1,length=10)), method="REML")
+data = data.frame(int, x, z)
+mod <- gam(y ~ s(x,bs="cc",k=10) + s(z), method="REML")
+# summary(mod)
+
+# sp.vcov() is to extract "smoothing parameter (lambda)" estimator covaiance matrix
+# sp.vcov(mod)
+diag(sp.vcov(mod))
+det(sp.vcov(mod))
+log(det(sp.vcov(mod)))
+
+## In conclusion, we can use vcov() to find the information matrix.
+# vcov(mod)
+diag(vcov(mod))
+det(vcov(mod))
+log(det(vcov(mod)))
+
+## vcov.gam()
+# freq = FALSE: to return the Bayesian posterior covariance matrix of the parameters. -> choose
+
+# vcov.gam(mod, freq = FALSE)
+diag(vcov.gam(mod, freq = FALSE))
+det(vcov.gam(mod, freq = FALSE))
+log(det(vcov.gam(mod, freq = FALSE)))
+
+## vcov.gam()
+# freq = TRUE: to return the frequentist covariance matrix of the parameter estimators,
+# vcov.gam(mod, freq = TRUE)
+diag(vcov.gam(mod, freq = TRUE))
+det(vcov.gam(mod, freq = TRUE))
+log(det(vcov.gam(mod, freq = TRUE)))
+
+```
+
+## compute Variance matrix of parameters (beta) manually
+```{r}
+# library(data.table)
+# library(matlib)
+# 
+# df     = data.table(y = runif(100, 0, 100),
+#                     x = runif(100, 0, 100),
+#                     z = runif(100, 0, 100))
+# mod    = lm(y ~ ., df)
+# summary(mod)
+# X      = cbind(1, as.matrix(df[, -1])) # creating data matrix X
+# b = diag(c(1,1,1))
+# invXtX = solve(crossprod(X), b) # crossprod(X) = X^T X
+# # solve(X, b) solves for X in the equation AX=b -> X = A^T b = A^T (since b = I here)
+# # solve(crossprod(X), I) = inv(crossprod(X))
+# coef   = invXtX %*% t(X) %*% df$y # (X^T X)^(-1) X^T y = beta
+# resid  = df$y - X %*% coef # y - y_hat
+# df.res = nrow(X) - ncol(X) # df of error = n - p
+# manual = invXtX * sum(resid**2)/(df.res) # (X^T X)^(-1) * sigma where sigma = SS / df
+# funct  = vcov(mod)
+# all.equal(manual, funct, check.attributes = F) # should be TRUE
+```
+
+## 1.2 Functions
+### logistic function (sigmoid function)
+```{r}
+log.function = function(pred) {
+  pred[which(pred > 700)] = 700
+  prob = exp(pred)/(1 + exp(pred))
+  return(prob)
+}
+```
+
+### selecting initial set k (2/k is 0, 2/k is 1)
+```{r}
+# 'get_k_random_samples' function: select the k random sample from train_full = X_train_full + y_train_full
+
+get_k_random_samples = function(initial_k, my.seed, X_train_full, y_train_full) {
+  # initial_labeled_samples: 'k' samples
+  # train_full
+  set.seed(my.seed)
+  ind_k_0 = sample(sum(y_train_full == 0),
+                        as.integer(initial_k / 2),
+                        replace = FALSE)
+  # ind_k_0
+  X_train_0 = X_train_full[y_train_full == 0][ind_k_0]
+  # str(X_train_full[y_train_full == 0])
+  # X_train_0
+  y_train_0 = y_train_full[y_train_full == 0][ind_k_0]
+  # y_train_0
+  X_val_0 = X_train_full[y_train_full == 0][-ind_k_0]
+  # dim(X_val_0)
+  y_val_0 = y_train_full[y_train_full == 0][-ind_k_0]
+  
+  
+  ind_k_1 = sample(sum(y_train_full == 1),
+                        as.integer(initial_k / 2),
+                        replace = FALSE)
+  X_train_1 = X_train_full[y_train_full == 1][ind_k_1]
+  # dim(X_train_full[y_train_full == 1,])
+  # X_train_1
+  y_train_1 = y_train_full[y_train_full == 1][ind_k_1]
+  # y_train_1
+  X_val_1 = X_train_full[y_train_full == 1][-ind_k_1]
+  # dim(X_val_1)
+  y_val_1 = y_train_full[y_train_full == 1][-ind_k_1]
+
+  X_train = c(X_train_0, X_train_1)
+  y_train = c(y_train_0, y_train_1)
+  X_val = c(X_val_0, X_val_1)
+  y_val = c(y_val_0, y_val_1)
+  
+  return(list(X_train, y_train, X_val, y_val))
+}
+```
+
+### fitting gam and output performance
+
+https://stackoverflow.com/questions/46265998/covariance-matrix-of-the-estimated-parameteric-coefficients-and-estimated-smooth
+```{r}
+  gam.perf = function(X_train, y_train, X_test, y_test){
+
+  # X_train = X_train_full  
+  # y_train = y_train_full
+    
+    
+      wt = weight(y_train, weight.gam.perf)
+      fit = gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+    
+    # fit = gam(y_train_full ~ s(X_train_full, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial)    
+    ##############
+    # GAM CHECK  #
+    ##############
+    # gam.check(fit)
+    # plot.gam(fit)
+    # summary(fit)
+    # sp.vcov(fit)
+    # vcov.gam(fit)
+    
+    
+    pred = predict(fit, newdata = list(X_train = X_test), type = "link") # type = "link" or without: output x'b, type = "response": output probability (not recommended)
+    y_prob = as.matrix(log.function(pred)) # convert "pred" to probability with logistic function
+    y_pred = rep(0, length(y_prob))
+    y_pred[y_prob > 0.5] = 1
+    # confu_table = table(y_pred, y_test)
+    # confu_table
+    confu = confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+    # confu
+    
+    TN = confu[1,1]
+    FN = confu[1,2]
+    FP = confu[2,1]
+    TP = confu[2,2]
+    
+    error.accu = mean(y_pred == y_test)  
+    f_measure = (2*TP)/(2*TP + FP + FN)
+    Gmean = sqrt((TP/(TP+FN))*(TN/(TN+FP)))
+    
+    fg = y_prob[y_test == 1]
+    bg = y_prob[y_test == 0]
+    
+    pr = pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+    auc.pr = pr$auc.integral
+    
+    roc = roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+    # plot(roc)
+    auc = roc$auc
+    
+    # Calculate True Positive Rate (TPR) and True Negative Rate (TNR)
+    TPrate = TP / (TP + FN)
+    TNrate = TN / (TN + FP)
+  
+    return(list(error.accu, f_measure, Gmean, auc, auc.pr, TPrate, TNrate, confu))
+  }
+```
+
+```{r}
+  rand.perf = function(X_train, y_train, X_test, y_test){
+      wt = weight(y_train, weight.rand.perf)
+      fit = gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+
+    # fit = gam(y_train_full ~ s(X_train_full, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial)    
+    ##############
+    # GAM CHECK  #
+    ##############
+    # gam.check(fit)
+    # plot.gam(fit)
+    # summary(fit)
+    # sp.vcov(fit)
+    # vcov.gam(fit)
+    
+    
+    pred = predict(fit, newdata = list(X_train = X_test), type = "link") # type = "link" or without: output x'b, type = "response": output probability (not recommended)
+    y_prob = as.matrix(log.function(pred)) # convert "pred" to probability with logistic function
+    y_pred = rep(0, length(y_prob))
+    y_pred[y_prob > 0.5] = 1
+    # confu_table = table(y_pred, y_test)
+    # confu_table
+    confu = confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+    # confu
+    
+    TN = confu[1,1]
+    FN = confu[1,2]
+    FP = confu[2,1]
+    TP = confu[2,2]
+    
+    error.accu = mean(y_pred == y_test)  
+    f_measure = (2*TP)/(2*TP + FP + FN)
+    Gmean = sqrt((TP/(TP+FN))*(TN/(TN+FP)))
+    
+    fg = y_prob[y_test == 1]
+    bg = y_prob[y_test == 0]
+    
+    pr = pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+    auc.pr = pr$auc.integral
+    
+    roc = roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+    # plot(roc)
+    auc = roc$auc
+    
+    # Calculate True Positive Rate (TPR) and True Negative Rate (TNR)
+    TPrate = TP / (TP + FN)
+    TNrate = TN / (TN + FP)
+  
+    return(list(error.accu, f_measure, Gmean, auc, auc.pr, TPrate, TNrate, confu))
+  }
+```
+
+### fitting glm and output performance
+```{r}
+  glm.perf = function(X_train, y_train, X_test, y_test){
+    fit = glm(y_train ~ X_train, family = binomial)
+    # gam.check(fit)
+    # plot(fit)
+    pred = predict(fit, newdata = list(X_train = X_test), type = "link") # type = "link" or without: output x'b, type = "response": output probability (not recommended)
+    y_prob = as.matrix(log.function(pred)) # convert "pred" to probability with logistic function
+    y_pred = rep(0, length(y_prob))
+    y_pred[y_prob > 0.5] = 1
+    # confu_table = table(y_pred, y_test)
+    # confu_table
+    confu = confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+    # confu
+    
+    TN = confu[1,1]
+    FN = confu[1,2]
+    FP = confu[2,1]
+    TP = confu[2,2]
+    
+    error.accu = mean(y_pred == y_test)  
+    f_measure = (2*TP)/(2*TP + FP + FN)
+    Gmean = sqrt((TP/(TP+FN))*(TN/(TN+FP)))
+    
+    fg = y_prob[y_test == 1]
+    bg = y_prob[y_test == 0]
+    
+    pr = pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+    auc.pr = pr$auc.integral
+    
+    roc = roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+    # plot(roc)
+    auc = roc$auc
+    
+    # Calculate True Positive Rate (TPR) and True Negative Rate (TNR)
+    TPrate = TP / (TP + FN)
+    TNrate = TN / (TN + FP)
+  
+    return(list(error.accu, f_measure, Gmean, auc, auc.pr, TPrate, TNrate, confu))
+  }
+```
+
+
+
+```{r}
+dt.perf = function(X_train, y_train, X_test, y_test) {
+  
+  # X_train = X_train_full
+  # y_train = y_train_full
+  # 
+  # X_train = dat.tomek$X
+  # y_train = dat.tomek$Y
+  
+  # fit = rpart(y_train ~ X_train, data = data.frame(X_train, y_train), method = "class")
+  fit = rpart(y_train ~ X_train, method = "class")
+  
+  # Predict the class probabilities
+  pred = predict(fit, newdata = list(X_train = X_test), type = "prob")[, 2]
+  y_prob = as.matrix(pred) # Probability of the positive class
+  y_pred = rep(0, length(y_prob))
+  y_pred[y_prob > 0.5] = 1
+  
+  if (length(unique(y_pred)) == 1) { 
+    y_pred = factor(y_pred, levels = levels(as.factor(y_test)))
+  }
+
+  # confu = confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+  
+  
+  confu <- tryCatch({
+  confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+  }, error = function(e) {
+    message("An error occurred, skipping the confusionMatrix command: ", e$message)
+    print(confu)
+    confu # Assign a default value or handle as needed
+  })
+  
+  TN = confu[1,1]
+  FN = confu[1,2]
+  FP = confu[2,1]
+  TP = confu[2,2]
+  
+  error.accu = mean(y_pred == y_test)  
+  f_measure = (2*TP)/(2*TP + FP + FN)
+  Gmean = sqrt((TP/(TP+FN))*(TN/(TN+FP)))
+  
+  fg = y_prob[y_test == 1]
+  bg = y_prob[y_test == 0]
+  
+  # Check if y_pred has both 0s and 1s
+  if (length(unique(y_pred)) > 1) {
+    pr = pr.curve(scores.class0 = fg, scores.class1 = bg, curve = TRUE)
+    auc.pr = pr$auc.integral
+  } else {
+    message("Cannot compute AUC-PR curve because y_pred contains only one class")
+    auc.pr = 0.5
+  }
+  
+  roc = roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+  auc = roc$auc
+  
+  # Calculate True Positive Rate (TPR) and True Negative Rate (TNR)
+  TPrate = TP / (TP + FN)
+  TNrate = TN / (TN + FP)
+  
+  return(list(error.accu, f_measure, Gmean, auc, auc.pr, TPrate, TNrate, confu))
+}
+
+```
+
+
+```{r}
+svm.perf = function(X_train, y_train, X_test, y_test) {
+  
+  # X_train = X_train_full
+  # y_train = y_train_full
+  
+  # X_train = as.data.frame(dat.SMOTE$X)
+  # X_test = as.data.frame(X_test)
+  
+  # Train SVM model
+  fit = svm(X_train, y_train, probability = TRUE)
+  
+  # Predict the class probabilities
+  pred = predict(fit, X_test, probability = TRUE)
+  
+  # y_prob = attr(pred, "probabilities")[,"1"]
+  y_prob = pred
+  
+  y_pred = rep(0, length(y_prob))
+  y_pred[y_prob > 0.5] = 1
+  
+  if (length(levels(as.factor(y_pred))) == 0) { # if 'y_pred' has only zeros or ones
+    y_pred = factor(y_pred, levels = levels(as.factor(y_test)))
+  }
+
+  # confu = confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+  
+  confu <- tryCatch({
+  confusionMatrix(as.factor(y_pred), as.factor(y_test))$table
+  }, error = function(e) {
+    message("An error occurred, skipping the confusionMatrix command: ", e$message)
+    print(confu)
+    confu # Assign a default value or handle as needed
+  })
+  
+  TN = confu[1,1]
+  FN = confu[1,2]
+  FP = confu[2,1]
+  TP = confu[2,2]
+  
+  error.accu = mean(y_pred == y_test)  
+  f_measure = (2*TP)/(2*TP + FP + FN)
+  Gmean = sqrt((TP/(TP+FN))*(TN/(TN+FP)))
+  
+  fg = y_prob[y_test == 1]
+  bg = y_prob[y_test == 0]
+  
+  # Check if y_pred has both 0s and 1s
+  if (length(unique(y_pred)) > 1) {
+    pr = pr.curve(scores.class0 = fg, scores.class1 = bg, curve = TRUE)
+    auc.pr = pr$auc.integral
+  } else {
+    message("Cannot compute PR curve because y_pred contains only one class")
+    auc.pr = 0.5
+  }
+  
+  roc = roc.curve(scores.class0 = fg, scores.class1 = bg, curve = TRUE)
+  auc = roc$auc
+  
+  # Calculate True Positive Rate (TPR) and True Negative Rate (TNR)
+  TPrate = TP / (TP + FN)
+  TNrate = TN / (TN + FP)
+  
+  return(list(error.accu, f_measure, Gmean, auc, auc.pr, TPrate, TNrate, confu))
+}
+
+```
+
+
+### gam.plot
+```{r}
+gam.plot = function(X_train, y_train, X_test, y_test, bs = bs.in, type = "binomial", title = "title") {
+    mod = mgcv::gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = type)
+    pred = predict(mod, newdata = list(X_train = X_test), se = TRUE)
+    se.band = cbind(pred$fit + 2 * pred$se.fit, pred$fit - 2 * pred$se.fit)
+    plot(x = X_test, y = y_test, cex = .5, col = 'darkgrey', main = title, xlab = "", ylab = "", xlim = c(min(X_test), max(X_test)), ylim = c(min(y_test), max(y_test)))
+    
+    ##############
+    # Regression #
+    ##############
+    if (type == "gaussian") {
+      lines(x = X_test, y = pred$fit, lwd = 2, col = "blue")
+      matlines(x = X_test, y = se.band, lwd = 1, col = "blue", lty = 3)
+      abline(h = 0, col="red", lwd = .1)
+      
+    ##################
+    # Classification #
+    ##################
+    } else if (type == "binomial") {
+      lines(x = X_test, y = log.function(pred$fit), lwd = 2, col = "blue")
+      matlines(x = X_test, y = log.function(se.band), lwd = 1, col = "blue", lty = 3)
+      abline(h = 0.5, col="red", lwd = .1)
+    }
+    
+}
+
+# gam.plot(dat$Year, dat$Temperature, dat$Year, dat$Temperature, bs = "tp",  type = "binomial", title = "Classification with GAM")
+```
+
+### glm.plot
+```{r}
+glm.plot = function(X_train, y_train, X_test, y_test, type = "binomial", title = "title") {
+  mod = glm(y_train ~ X_train, family = type)
+  pred = predict(mod, newdata = list(X_train = X_test), se = TRUE)
+  se.band = cbind(pred$fit + 2 * pred$se.fit, pred$fit - 2 * pred$se.fit)
+  
+  ##############
+  # Regression #
+  ##############
+  if (type == "gaussian") {
+    plot(x = X_test, y = y_test, cex = .5, col = 'darkgrey', main = title, xlab = "", ylab = "")
+    lines(x = X_test, y = pred$fit, lwd = 2, col = "blue")
+    matlines(x = X_test, y = se.band, lwd = 1, col = "blue", lty = 3)
+    abline(h = 0, col="red", lwd = .1)
+    
+  ##################
+  # Classification #
+  ##################
+  } else if (type == "binomial") {
+    plot(x = X_test, y = y_test, cex = .5, col = 'darkgrey', main = title, xlab = "", ylab = "")
+    lines(x = X_test, y = log.function(pred$fit), lwd = 2, col = "blue")
+    matlines(x = X_test, y = log.function(se.band), lwd = 1, col = "blue", lty = 3)
+    abline(h = 0.5, col="red", lwd = .1)
+  }
+  
+}
+
+# glm.plot(gtemp$Year, gtemp$Temperature, gtemp$Year, gtemp$Temperature, type = "gaussian", title = "Regression")
+# 
+# glm.plot(gtemp$Year, I(gtemp$Temperature>0), gtemp$Year, I(gtemp$Temperature>0), type = "binomial", title = "Classification")
+```
+
+### Active selection with GAM (Margin sampling)
+```{r}
+gam.active = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats) { # 'y_val' is needed here since we need to update 'y_val' after marginal sampling
+  
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr, col 6: TPrate, col 7: TNrate
+  error.test.confu = list()
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+   
+    ###################
+    # margin sampling #
+    ###################
+      wt = weight(y_train, weight.selection)
+      mod = mgcv::gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+      pred = predict(mod, newdata = list(X_train = X_val), se.fit = TRUE)
+    
+    if (margin.selection == 1) {
+      prob = log.function(pred$fit)
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+      # y_ind = which.min(prob.matrix[,3])
+      y_ind = which.minn(prob.matrix[,3], 1)
+    } else if (margin.selection == 2) {
+      y_ind = which.minn(pred$se.fit,1)
+    }
+    
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in active ========================"))
+    
+    X_train = c(X_train, X_val[y_ind])
+    y_train = c(y_train, y_val[y_ind])
+    X_val = X_val[-y_ind]
+    y_val = y_val[-y_ind]
+
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+        
+    perf.out = gam.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(c("TPrate", perf.out[[6]]))
+    # print(c("TNrate", perf.out[[7]]))
+    # print(perf.out[[8]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+}
+
+```
+
+### Active selection with GLM (Margin sampling)
+```{r}
+glm.active = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats) { # 'y_val' is needed here since we need to update 'y_val' after marginal sampling
+  
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+   
+    ###################
+    # margin sampling #
+    ###################
+    mod = glm(y_train ~ X_train, family = binomial)
+    pred = predict(mod, newdata = list(X_train = X_val), se = TRUE)
+    prob = log.function(pred$fit)
+    prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+    y_ind = which.min(prob.matrix[,3])
+    
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in active ========================"))
+    
+    X_train = c(X_train, X_val[y_ind])
+    y_train = c(y_train, y_val[y_ind])
+    X_val = X_val[-y_ind]
+    y_val = y_val[-y_ind]
+
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+        
+    perf.out = glm.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+}
+
+```
+
+
+### Active selection with GAM (optimal)
+
+```{r}
+gam.active.opt = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats) { # 'y_val' is needed here since we need to update 'y_val' after marginal sampling
+  
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  vcov.vector = rep(0, x_sel)
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+
+    ###################
+    # margin sampling #
+    ###################
+    
+    if (opt.selection == 1) {
+      print("opt.selection == 1")
+      
+      wt = weight(y_train, weight.selection)
+      mod = mgcv::gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+        
+      pred = predict(mod, newdata = list(X_train = X_val), se = TRUE)
+      prob = log.function(pred$fit)
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+      y_ind = which.minn(prob.matrix[,3], x_sel)
+    }
+    
+    ###################
+    # random sampling #
+    ###################
+    
+    if (opt.selection == 2){
+    print("opt.selection == 2")
+    set.seed(my.seed)
+    y_ind = sample(length(y_val), x_sel, replace = FALSE)
+    }
+    
+    ##############
+    # optimality #
+    ##############
+
+    for (i in 1:length(y_ind)) {
+      # print(i)
+      ### apply "_temp" on April. 20. 2022
+      X_train_temp = c(X_train, X_val[y_ind[i]])
+      y_train_temp = c(y_train, y_val[y_ind[i]])
+      # print(X_train_temp)
+      # print(y_train_temp)
+      
+      wt = weight(y_train_temp, weight.selection)
+      mod = mgcv::gam(y_train_temp ~ s(X_train_temp, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+      
+      if (DAE.selection == 1) {
+        # D-optimiality #
+        vcov.vector[i] = log(det(vcov.gam(mod)))
+        
+      } else if (DAE.selection == 2) {
+        # A-optimiality #
+        vcov.vector[i] = log(lava::tr(vcov.gam(mod)))
+        
+      } else if (DAE.selection == 3) {
+        # E-optimiality #
+        vcov.vector[i] = max(log(eigen(vcov.gam(mod))$values))
+      }
+
+     }
+    
+    y_ind = y_ind[which.min(vcov.vector)]
+    # y_ind = y_ind[which.max(vcov.vector)]
+    
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in active ========================"))
+    
+    X_train = c(X_train, X_val[y_ind])
+    y_train = c(y_train, y_val[y_ind])
+    X_val = X_val[-y_ind]
+    y_val = y_val[-y_ind]
+
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+        
+    perf.out = gam.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+}
+
+```
+
+
+
+### Active selection with GAM (optimal)
+
+```{r}
+gam.active.perf = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats) { # 'y_val' is needed here since we need to update 'y_val' after marginal sampling
+  
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  # vcov.vector = rep(0, x_sel)
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+
+    ###################
+    # margin sampling #
+    ###################
+    if (opt.selection == 1) {
+      print("opt.selection == 1")
+      
+      wt = weight(y_train, weight.selection)
+      mod = mgcv::gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+        
+      pred = predict(mod, newdata = list(X_train = X_val), se = TRUE)
+      prob = log.function(pred$fit)
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+      y_ind = which.minn(prob.matrix[,3], x_sel)
+
+    ###################
+    # random sampling #
+    ###################
+    } else if (opt.selection == 2){
+      print("opt.selection == 2")
+      set.seed(my.seed)
+      y_ind = sample(length(y_val), x_sel, replace = FALSE)
+    }
+
+    ##############
+    # F-measure  #
+    ##############
+    if (perf.selection == 1) {
+      f.vector = rep(0, length(y_ind))
+      for (i in 1:length(y_ind)) {
+        # print(i)
+        ### apply "_temp" on April. 20. 2022
+        X_train_temp = c(X_train, X_val[y_ind[i]])
+        y_train_temp = c(y_train, y_val[y_ind[i]])
+        X_val_temp = X_val[-y_ind[i]]
+        y_val_temp = y_val[-y_ind[i]]
+        # print(X_train_temp)
+        # print(y_train_temp)
+        
+        ## 5.11.2022 f.perf update ##
+        # F-measure on test set
+        # f.perf = gam.perf(X_train_temp, y_train_temp, X_test, y_test)[[2]]
+        
+        # F-measure on set S^c (validation)
+        f.perf = gam.perf(X_train_temp, y_train_temp, X_val_temp, y_val_temp)[[2]]
+        
+        # F-measure on set S (training)
+        # f.perf = gam.perf(X_train_temp, y_train_temp, X_train_temp, y_train_temp)[[2]]
+        
+        f.vector[i] = f.perf
+      }
+      
+      ### which.max not which.min ###
+      y_ind_cs = y_ind[which.max(f.vector)]
+      # y_ind = y_ind[which.max(vcov.vector)]
+
+    ###########
+    # G-mean  #
+    ###########    
+    } else if (perf.selection == 2) {
+      g.vector = rep(0, length(y_ind))
+      for (i in 1:length(y_ind)) {
+        # print(i)
+        ### apply "_temp" on April. 20. 2022
+        X_train_temp = c(X_train, X_val[y_ind[i]])
+        y_train_temp = c(y_train, y_val[y_ind[i]])
+        X_val_temp = X_val[-y_ind[i]]
+        y_val_temp = y_val[-y_ind[i]]
+        # print(X_train_temp)
+        # print(y_train_temp)
+        
+        g.perf = gam.perf(X_train_temp, y_train_temp, X_val_temp, y_val_temp)[[3]]
+        
+        g.vector[i] = g.perf
+      }
+      
+      ### which.max not which.min ###
+      y_ind_cs = y_ind[which.max(g.vector)]
+      # y_ind = y_ind[which.max(vcov.vector)]
+    }
+
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in active ========================"))
+    
+    X_train = c(X_train, X_val[y_ind_cs])
+    y_train = c(y_train, y_val[y_ind_cs])
+    X_val = X_val[-y_ind_cs]
+    y_val = y_val[-y_ind_cs]
+
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+        
+    perf.out = gam.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+}
+
+```
+
+### Active selection with decision tree
+```{r}
+dt.active.perf = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats) { # 'y_val' is needed here since we need to update 'y_val' after marginal sampling
+  
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  # vcov.vector = rep(0, x_sel)
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+    
+    ###################
+    # margin sampling #
+    ###################
+    if (opt.selection == 1) {
+      print("opt.selection == 1")
+      
+      wt = weight(y_train, weight.selection)
+      mod = mgcv::gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+        
+      pred = predict(mod, newdata = list(X_train = X_val), se = TRUE)
+      prob = log.function(pred$fit)
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+      y_ind = which.minn(prob.matrix[,3], x_sel)
+
+    ###################
+    # random sampling #
+    ###################
+    } else if (opt.selection == 2){
+      print("opt.selection == 2")
+      set.seed(my.seed)
+      y_ind = sample(length(y_val), x_sel, replace = FALSE)
+      
+    } else if (opt.selection == 3){
+      print("opt.selection == 3")
+      
+      fit = rpart(y_train ~ X_train, method = "class")
+  
+      # Predict the class probabilities
+      pred = predict(fit, newdata = list(X_train = X_test), type = "prob")[, 2]
+      pred = prob    
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1)) # diff = prob - (1 - prob) = 2 * prob - 1
+      y_ind = which.minn(prob.matrix[,3], x_sel)
+    }
+
+    ##############
+    # F-measure  #
+    ##############
+    if (perf.selection == 1) { # F-measure
+      f.vector = rep(0, length(y_ind))
+      for (i in 1:length(y_ind)) {
+        # print(i)
+        ### apply "_temp" on April. 20. 2022
+        X_train_temp = c(X_train, X_val[y_ind[i]])
+        y_train_temp = c(y_train, y_val[y_ind[i]])
+        X_val_temp = X_val[-y_ind[i]]
+        y_val_temp = y_val[-y_ind[i]]
+        # print(X_train_temp)
+        # print(y_train_temp)
+        
+        ## 5.11.2022 f.perf update ##
+        # F-measure on test set
+        # f.perf = gam.perf(X_train_temp, y_train_temp, X_test, y_test)[[2]]
+        
+        # F-measure on set S^c (validation)
+        f.perf = dt.perf(X_train_temp, y_train_temp, X_val_temp, y_val_temp)[[2]]
+        
+        # F-measure on set S (training)
+        # f.perf = gam.perf(X_train_temp, y_train_temp, X_train_temp, y_train_temp)[[2]]
+        
+        f.vector[i] = f.perf
+      }
+      
+      ### which.max not which.min ###
+      y_ind_cs = y_ind[which.max(f.vector)]
+      # y_ind = y_ind[which.max(vcov.vector)]
+
+    } 
+
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in active ========================"))
+    
+    X_train = c(X_train, X_val[y_ind_cs])
+    y_train = c(y_train, y_val[y_ind_cs])
+    X_val = X_val[-y_ind_cs]
+    y_val = y_val[-y_ind_cs]
+
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+        
+    perf.out = dt.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+}
+
+```
+
+### Active selection with SVM
+```{r}
+svm.active.perf = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats) { # 'y_val' is needed here since we need to update 'y_val' after marginal sampling
+  
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  # vcov.vector = rep(0, x_sel)
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+    
+    ###################
+    # margin sampling #
+    ###################
+    if (opt.selection == 1) {
+      print("opt.selection == 1")
+      
+      wt = weight(y_train, weight.selection)
+      mod = mgcv::gam(y_train ~ s(X_train, fx = FALSE, bs = bs.in, k = k.num), method = 'REML', family = binomial, weights = wt)
+        
+      pred = predict(mod, newdata = list(X_train = X_val), se = TRUE)
+      prob = log.function(pred$fit)
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+      y_ind = which.minn(prob.matrix[,3], x_sel)
+
+    ###################
+    # random sampling #
+    ###################
+    } else if (opt.selection == 2){
+      print("opt.selection == 2")
+      set.seed(my.seed)
+      y_ind = sample(length(y_val), x_sel, replace = FALSE)
+      
+    } else if (opt.selection == 3){
+      print("opt.selection == 3")
+      
+      fit = svm(X_train, y_train, probability = TRUE)  
+      
+      # Predict the class probabilities
+      pred = predict(fit, X_test, probability = TRUE)
+      pred = prob    
+      prob.matrix = data.frame("prob_1" = prob, "prob_0" = 1 - prob, "diff" = abs(2*prob - 1))
+      y_ind = which.minn(prob.matrix[,3], x_sel)
+    }
+
+    ##############
+    # F-measure  #
+    ##############
+    if (perf.selection == 1) { # F-measure
+      f.vector = rep(0, length(y_ind))
+      for (i in 1:length(y_ind)) {
+        # print(i)
+        ### apply "_temp" on April. 20. 2022
+        X_train_temp = c(X_train, X_val[y_ind[i]])
+        y_train_temp = c(y_train, y_val[y_ind[i]])
+        X_val_temp = X_val[-y_ind[i]]
+        y_val_temp = y_val[-y_ind[i]]
+        # print(X_train_temp)
+        # print(y_train_temp)
+        
+        ## 5.11.2022 f.perf update ##
+        # F-measure on test set
+        # f.perf = gam.perf(X_train_temp, y_train_temp, X_test, y_test)[[2]]
+        
+        # F-measure on set S^c (validation)
+        f.perf = svm.perf(X_train_temp, y_train_temp, X_val_temp, y_val_temp)[[2]]
+        
+        # F-measure on set S (training)
+        # f.perf = gam.perf(X_train_temp, y_train_temp, X_train_temp, y_train_temp)[[2]]
+        
+        f.vector[i] = f.perf
+      }
+      
+      ### which.max not which.min ###
+      y_ind_cs = y_ind[which.max(f.vector)]
+      # y_ind = y_ind[which.max(vcov.vector)]
+
+    } 
+
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in active ========================"))
+    
+    X_train = c(X_train, X_val[y_ind_cs])
+    y_train = c(y_train, y_val[y_ind_cs])
+    X_val = X_val[-y_ind_cs]
+    y_val = y_val[-y_ind_cs]
+
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+        
+    perf.out = svm.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+}
+
+```
+
+### Random selection (GAM)
+```{r}
+gam.random = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats, seed) {
+  set.seed(seed)
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+   
+    ###################
+    # random sampling #
+    ###################
+    set.seed(my.seed)
+    y_ind = sample(length(y_val), 1, replace = FALSE)
+    
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in random ======================== "))
+    
+    X_train = c(X_train, X_val[y_ind])
+    y_train = c(y_train, y_val[y_ind])
+    X_val = X_val[-y_ind]
+    y_val = y_val[-y_ind]
+    
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+    
+    ### update on April. 14. 2022 ###
+    # use rand.perf to utilize hyper-parameter "weight.rand.perf"
+    perf.out = rand.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+
+}
+```
+
+### Random selection (glm)
+```{r}
+glm.random = function(X_train, y_train, X_val, y_val, X_test, y_test, repeats, seed) {
+  set.seed(seed)
+  count = 0
+  error.test = matrix(NA, nrow = repeats, ncol=7) # col 1: accu, col 2: F, col 3: Gmean, col 4: auc, col 5: auc-pr
+  error.test.confu = list()
+  
+  for (r in 1:repeats) { # selection process during 'repeats'
+    count = count + 1
+   
+    ###################
+    # random sampling #
+    ###################
+    set.seed(my.seed) ### April. 11. 2022 (added) ###
+    y_ind = sample(length(y_val), 1, replace = FALSE)
+    
+    # update X_train, y_train, X_val, y_val
+    print(c(r,"repitition in random ======================== "))
+    
+    X_train = c(X_train, X_val[y_ind])
+    y_train = c(y_train, y_val[y_ind])
+    X_val = X_val[-y_ind]
+    y_val = y_val[-y_ind]
+    
+    # print(c("X_train", length(X_train)))
+    # print(c("y_train", length(y_train)))
+    # print(c("X_val", length(X_val)))
+    # print(c("y_val", length(y_val)))
+    
+    perf.out = glm.perf(X_train, y_train, X_test, y_test)
+    
+    error.test[count,1] = perf.out[[1]]
+    error.test[count,2] = perf.out[[2]]
+    error.test[count,3] = perf.out[[3]]
+    error.test[count,4] = perf.out[[4]]
+    error.test[count,5] = perf.out[[5]]
+    error.test[count,6] = perf.out[[6]]
+    error.test[count,7] = perf.out[[7]]
+    error.test.confu[[count]] = perf.out[[8]]
+    
+    # print(c("accuracy", perf.out[[1]]))
+    # print(c("F measure", perf.out[[2]]))
+    # print(c("G mean", perf.out[[3]]))
+    # print(c("AUC", perf.out[[4]]))
+    # print(c("PR", perf.out[[5]]))
+    # print(perf.out[[6]])
+    
+  } # selection process during 'repeats'
+
+X_train_final = X_train
+y_train_final = y_train
+
+return(list(error.test, X_train_final, y_train_final, error.test.confu))  
+
+}
+```
+
+### Performance print
+```{r}
+perf.print = function(text.input = "text_input", perf.out) {
+  print(c(text.input, "Accuracy", round(perf.out[[1]], 3)))
+  print(c(text.input, "F measure", round(perf.out[[2]], 3)))
+  print(c(text.input, "G mean", round(perf.out[[3]], 3)))
+  print(c(text.input, "AUC", round(perf.out[[4]], 3)))
+  print(c(text.input, "PR", round(perf.out[[5]], 3)))
+  print(c(text.input, "TPR", round(perf.out[[6]], 3)))
+  print(c(text.input, "TNR", round(perf.out[[7]], 3)))
+  print(perf.out[[8]])
+}
+```
+
+## weight
+```{r}
+# Y: label column
+weight = function(Y, weight.selection) {
+  
+  fraction_0 <- rep(1 - (sum(Y == 0) / length(Y)), sum(Y == 0))
+  fraction_1 <- rep(1 - (sum(Y == 1) / length(Y)), sum(Y == 1))
+
+  # assign that value to a "weights" vector
+  weights <- numeric(length(Y)) # empty vector
+
+  if (weight.selection == 1) {
+    weights[Y == 0] <- fraction_0
+    weights[Y == 1] <- fraction_1
+    weights = round(weights, 2) * 100 # 1st weight formula
+  } else if (weight.selection == 2) {
+    weights <- rep(1, length(Y)) # all ones -> no weighting
+  } else if (weight.selection == 3) {
+    weights = weights/mean(weights) # 2nd weight formula
+  } else if (weight.selection == 4) {
+    weights = round(weights/min(weights),0) # 3rd weight formula
+  }
+  
+  return(weights)
+}
+```
+
+```{r}
+# Y: label column
+weight2 = function(Y, weight.selection) {
+  
+  fraction_0 <- 0
+  fraction_1 <- 1
+
+  # assign that value to a "weights" vector
+  weights <- numeric(length(Y))
+
+  if (weight.selection == 1) {
+    weights[Y == 0] <- fraction_0
+    weights[Y == 1] <- fraction_1
+  } else if (weight.selection == 2) {
+    weights <- rep(1, length(Y))
+  }
+  return(weights)
+}
+```
+
+```{r}
+# w = weight2(Y, 1)
+# w
+# round(w,2)*100
+```
+
+
+### merge k-fold output to single output
+```{r}
+k.fold.merge = function(cv.err.init, cv.active.out, loop.k, cv.err.full){
+  cv.err.init.matrix = matrix(0, nrow = 1, ncol = ncol(cv.active.out[[1]][[1]]))
+  cv.err.matrix = matrix(0, nrow = nrow(cv.active.out[[1]][[1]]), ncol = ncol(cv.active.out[[1]][[1]]))
+  cv.err.full.matrix = matrix(0, nrow = 1, ncol = ncol(cv.active.out[[1]][[1]]))
+  
+  for (j in 1:loop.k) {
+    cv.err.init.matrix = cv.err.init.matrix + cv.err.init[[j]]
+    cv.err.matrix = cv.err.matrix + cv.active.out[[j]][[1]]
+    cv.err.full.matrix = cv.err.full.matrix + cv.err.full[[j]]
+  }
+  
+  cv.err.init.matrix = cv.err.init.matrix/loop.k
+  cv.err.matrix = cv.err.matrix/loop.k
+  cv.err = rbind(cv.err.init.matrix, cv.err.matrix)
+  cv.err.full.matrix = cv.err.full.matrix/loop.k
+  
+  return(list(cv.err, cv.err.full.matrix))
+}
+```
+
+
+### Performance plot
+```{r}
+perf.plot = function(error.test.active, error.test.rand, length, error.test.active.2, ylim.vector) {
+  ### 1 Accuracy
+  err.accu.active = error.test.active[1:(1 + length),1]
+  err.accu.rand = error.test.rand[1:(1 + length),1]
+  
+  if (ylim.vector[1] == "active") {
+    ylim.1 = min(err.accu.active)
+  } else {
+    ylim.1 = min(err.accu.rand)
+  }
+
+  if (ylim.vector[2] == "active") {
+    ylim.2 = max(err.accu.active)
+  } else {
+    ylim.2 = max(err.accu.rand)
+  }
+  
+  plot(err.accu.active, 
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "accuracy", col = "blue")
+  points(err.accu.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[1]], col = "green4", lty = 3)
+  legend("bottom", legend=c("Active", "Random", "Full"),
+       col=c("blue", "red", "green4"), lty=c(1,1,3), cex=0.8)
+  
+  # strating a new 3x2 plot to display 6 different performance metrics
+  #####################
+  par(mfrow = c(3,2))
+  #####################
+  
+  ### 2 F-measure
+  err.F.active = error.test.active[1:(1 + length),2]
+  err.F.rand = error.test.rand[1:(1 + length),2]
+  
+  if (ylim.vector[3] == "active") {
+    ylim.1 = min(err.F.active)
+    # print("active")
+  } else {
+    ylim.1 = min(err.F.rand)
+    # print("rand")
+  }
+
+  if (ylim.vector[4] == "active") {
+    ylim.2 = max(err.F.active)
+  } else {
+    ylim.2 = max(err.F.rand)
+  }
+  
+  plot(err.F.active,
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "F-measure", col = "blue")
+  points(err.F.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[2]], col = "green4", lty = 3)
+  
+  ### 3 G mean
+  err.Gmean.active = error.test.active[1:(1 + length),3]
+  err.Gmean.rand = error.test.rand[1:(1 + length),3]
+  
+  if (ylim.vector[5] == "active") {
+    ylim.1 = min(err.Gmean.active)
+    # print("active")
+  } else {
+    ylim.1 = min(err.Gmean.rand)
+    # print("rand")
+  }
+
+  if (ylim.vector[6] == "active") {
+    ylim.2 = max(err.Gmean.active)
+  } else {
+    ylim.2 = max(err.Gmean.rand)
+  }
+  
+  plot(err.Gmean.active, 
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "G-mean", col = "blue")
+  points(err.Gmean.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[3]], col = "green4", lty = 3)
+  
+  ### 4 AUC
+  err.AUC.active = error.test.active[1:(1 + length),4]
+  err.AUC.rand = error.test.rand[1:(1 + length),4]
+
+  if (ylim.vector[7] == "active") {
+    ylim.1 = min(err.AUC.active)
+    # print("active")
+  } else {
+    ylim.1 = min(err.AUC.rand)
+    # print("rand")
+  }
+
+  if (ylim.vector[8] == "active") {
+    ylim.2 = max(err.AUC.active)
+  } else {
+    ylim.2 = max(err.AUC.rand)
+  }  
+
+  plot(err.AUC.active, 
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "AUC", col = "blue")
+  points(err.AUC.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[4]], col = "green4", lty = 3)
+  
+  ### 5 AUC-PR
+  err.PR.active = error.test.active[1:(1 + length),5]
+  err.PR.rand = error.test.rand[1:(1 + length),5]
+  
+  if (ylim.vector[9] == "active") {
+    ylim.1 = min(err.PR.active)
+    # print("active")
+  } else {
+    ylim.1 = min(err.PR.rand)
+    # print("rand")
+  }
+
+  if (ylim.vector[10] == "active") {
+    ylim.2 = max(err.PR.active)
+  } else {
+    ylim.2 = max(err.PR.rand)
+  }  
+
+  plot(err.PR.active, 
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "AUC-PR", col = "blue")
+  points(err.PR.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[5]], col = "green4", lty = 3)
+  
+  ### 6 TPrate
+  err.TP.active = error.test.active[1:(1 + length),6]
+  err.TP.rand = error.test.rand[1:(1 + length),6]
+  
+  if (ylim.vector[11] == "active") {
+    ylim.1 = min(err.TP.active)
+    # print("active")
+  } else {
+    ylim.1 = min(err.TP.rand)
+    # print("rand")
+  }
+
+  if (ylim.vector[12] == "active") {
+    ylim.2 = max(err.TP.active)
+  } else {
+    ylim.2 = max(err.TP.rand)
+  }  
+
+  plot(err.TP.active, 
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "TPrate", col = "blue")
+  points(err.PR.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[6]], col = "green4", lty = 3)
+  
+  ### 7 TNrate
+  err.TN.active = error.test.active[1:(1 + length),7]
+  err.TN.rand = error.test.rand[1:(1 + length),7]
+  
+  if (ylim.vector[13] == "active") {
+    ylim.1 = min(err.TN.active)
+    # print("active")
+  } else {
+    ylim.1 = min(err.TN.rand)
+    # print("rand")
+  }
+
+  if (ylim.vector[14] == "active") {
+    ylim.2 = max(err.TN.active)
+  } else {
+    ylim.2 = max(err.TN.rand)
+  }  
+
+  plot(err.TN.active, 
+       ylim = c(ylim.1, ylim.2),
+       type = 'l', cex = .5, main = "TNrate", col = "blue")
+  points(err.TN.rand, type = 'l', cex = .5, col = "red")
+  abline(h = error.test.active.2[[7]], col = "green4", lty = 3)
+
+}
+```
+
+### comparison plot (for comparison study)
+```{r}
+comp.plot = function(error.test.active, repeats) {
+  ### 1 Accuracy
+  err.accu.active = error.test.active[1:(1 + repeats),1]
+
+  ### 2 F-measure
+  err.F.active = error.test.active[1:(1 + repeats),2]
+
+  ### 3 G mean
+  err.Gmean.active = error.test.active[1:(1 + repeats),3]
+
+  ### 4 AUC
+  err.AUC.active = error.test.active[1:(1 + repeats),4]
+
+  ### 5 AUC-PR
+  err.PR.active = error.test.active[1:(1 + repeats),5]
+  
+  ### 6 TP
+  err.TP.active = error.test.active[1:(1 + repeats),6]
+  
+  ### 7 TN
+  err.TN.active = error.test.active[1:(1 + repeats),7]
+
+  return(list(
+    err.accu.active, err.F.active, err.Gmean.active, err.AUC.active, err.PR.active, err.TP.active, err.TN.active))
+
+}
+```
+
+### comparison plot #2
+```{r}
+comp.plot2 = function(x, length, y1, y2, y3, y4, y5, hline, 
+                      ylim, title, label, color) {
+  
+  plot(x = x[1:length], 
+       y = y1[1:length], 
+       ylim = ylim, 
+       main = title,
+       xlab = label[1], 
+       ylab = label[2], 
+       col = color[1],
+       type = 'l', 
+       cex = .5, 
+       lty = 1, 
+       cex.axis = .8)
+  
+  abline(h = hline, col = "green4", lty = 3)
+  
+  points(x = x[1:length], 
+         y = y2[1:length], 
+         col = color[2], 
+         type = 'l', 
+         cex = .5,
+         lty = 1)
+  
+  points(x = x[1:length], 
+         y = y3[1:length], 
+         col = color[3], 
+         type = 'l', 
+         cex = .5,
+         lty = 1)
+
+  points(x = x[1:length], 
+         y = y4[1:length], 
+         col = color[4], 
+         type = 'l', 
+         cex = .5,
+         lty = 1)
+  
+  points(x = x[1:length], 
+         y = y5[1:length], 
+         col = color[5], 
+         type = 'l', 
+         cex = .5,
+         lty = 1)
+}
+```
+
+# 2. Data
+## 2.1 Synthetic dataset
+```{r}
+if(data.selection == 1) { 
+  set.seed(my.seed)
+  p = 0.95
+  y.1 = rbinom(n = 200, size = 1, prob = p)
+  y.2 = rbinom(n = 500, size = 1, prob = (1 - p))
+  y.3 = rbinom(n = 300, size = 1, prob = p)
+  y = c(y.1, y.2, y.3)
+  x = c(1:length(y))
+  dat = data.frame(x,y)
+  # gam.plot(dat$x, dat$y, dat$x, dat$y)
+  
+  ##############
+  # Control IR #
+  ##############
+  ind = sample(which(dat$y == 1), sum(dat$y == 1)* 0.8, replace = FALSE)
+  dat = dat[-ind,]
+  
+  # IR
+  print(c("IR with imbalanced set", table(dat$y)[1] / table(dat$y)[2]))
+  
+  # plot points
+  plot(x = dat$x, y = dat$y)
+  
+  pdf(file = "syn_point.pdf") 
+  plot(x = dat$x, y = dat$y, cex = .5, col = 'darkgrey', main = "", xlab = "", ylab = "", xlim = c(min(dat$x), max(dat$x)), ylim = c(min(dat$y), max(dat$y)))
+  dev.off()
+  
+  # pdf(file = "syn_gam.pdf")
+  gam.plot(dat$x, dat$y, dat$x, dat$y, type = "binomial", title = "")
+  # dev.off()
+  
+  
+  # gam.perf(dat$x, dat$y, dat$x, dat$y)
+  
+  # pdf(file = "syn_glm.pdf")
+  glm.plot(dat$x, dat$y, dat$x, dat$y, type = "binomial", title = "")
+  # dev.off()
+}
+```
+
+## 2.11 synthetic-IR
+```{r}
+if (data.selection == 11){
+  set.seed(my.seed)
+  p = 0.95
+  y.1 = rbinom(n = 200, size = 1, prob = p)
+  y.2 = rbinom(n = 500, size = 1, prob = (1 - p))
+  y.3 = rbinom(n = 300, size = 1, prob = p)
+  y = c(y.1, y.2, y.3)
+  x = c(1:length(y))
+  dat = data.frame(x,y)
+  gam.plot(dat$x, dat$y, dat$x, dat$y)
+  
+  ##############
+  # Control IR #
+  ##############
+  
+  prop_min = c(0.8, 0.4, 0.2, 0.1, 0.08)
+  
+  
+  ind1 = sample(which(dat$y == 1), sum(dat$y == 1)* (1-prop_min[1]), replace = FALSE)
+  ind2 = sample(which(dat$y == 1), sum(dat$y == 1)* (1-prop_min[2]), replace = FALSE)
+  ind3 = sample(which(dat$y == 1), sum(dat$y == 1)* (1-prop_min[3]), replace = FALSE)
+  ind4 = sample(which(dat$y == 1), sum(dat$y == 1)* (1-prop_min[4]), replace = FALSE)
+  ind5 = sample(which(dat$y == 1), sum(dat$y == 1)* (1-prop_min[5]), replace = FALSE)
+  
+  
+  dat1 = dat[-ind1,]
+  dat2 = dat[-ind2,]
+  dat3 = dat[-ind3,]
+  dat4 = dat[-ind4,]
+  dat5 = dat[-ind5,]
+  
+  dat_IR = list(dat1, dat2, dat3, dat4, dat5)
+  
+  # IR
+  print(table(dat1$y))
+  print(table(dat2$y))
+  print(table(dat3$y))
+  print(table(dat4$y))
+  print(table(dat5$y))
+  print(c("IR with dat1", table(dat1$y)[1] / table(dat1$y)[2]))
+  print(c("IR with dat2", table(dat2$y)[1] / table(dat2$y)[2]))
+  print(c("IR with dat3", table(dat3$y)[1] / table(dat3$y)[2]))
+  print(c("IR with dat4", table(dat4$y)[1] / table(dat4$y)[2]))
+  print(c("IR with dat5", table(dat5$y)[1] / table(dat5$y)[2]))
+}
+
+
+```
+
+[1] 595
+[1] 88
+[1] 0
+
+
+## 2.12 Very large
+```{r}
+if (data.selection == 12){
+  set.seed(my.seed)
+  p = 0.95
+  y.1 = rbinom(n = 200, size = 1, prob = p)
+  y.2 = rbinom(n = 500, size = 1, prob = (1 - p))
+  y.3 = rbinom(n = 300, size = 1, prob = p)
+  y = c(y.1, y.2, y.3)
+  x = c(1:length(y))
+  dat = data.frame(x,y)
+  gam.plot(dat$x, dat$y, dat$x, dat$y)
+  
+  ##############
+  # Control IR #
+  ##############
+  ind = sample(which(dat$y == 1), sum(dat$y == 1)* 0.8, replace = FALSE)
+  dat = dat[-ind,]
+  
+  # IR
+  print(table(dat$y))
+  print(c("IR before augmentation", table(dat$y)[1] / table(dat$y)[2]))
+  
+  # Augmentation of data
+  gtemp = dat
+  dat = as.data.frame(gtemp[rep(seq_len(nrow(gtemp)), times = 10),])
+  
+  set.seed(my.seed)
+  dat$x = jitter(dat$x)
+
+  # IR
+  print(table(dat$y))
+  print(c("IR after augmentation", table(dat$y)[1] / table(dat$y)[2]))  
+  gam.plot(dat$x, dat$y, dat$x, dat$y)
+}
+
+
+```
+## 2.13 Noisy
+```{r}
+if (data.selection == 13){
+  set.seed(my.seed)
+  p = 0.95
+  y.1 = rbinom(n = 200, size = 1, prob = p)
+  y.2 = rbinom(n = 500, size = 1, prob = (1 - p))
+  y.3 = rbinom(n = 300, size = 1, prob = p)
+  y = c(y.1, y.2, y.3)
+  x = c(1:length(y))
+  dat = data.frame(x, y)
+  
+  ##############
+  # Control IR #
+  ##############
+  ind = sample(which(dat$y == 1), sum(dat$y == 1) * 0.8, replace = FALSE)
+  dat = dat[-ind,]
+  
+  
+  # IR
+  print(table(dat$y))
+  print(c("IR after noise", table(dat$y)[1] / table(dat$y)[2]))
+
+  gam.plot(dat$x, dat$y, dat$x, dat$y)
+  
+  # Add noise by randomly flipping a small proportion of 'y' values
+  noise_level = 0.1  # Adjust noise level to make it harder or easier
+  flip_indices = sample(1:length(dat$y), size = round(length(dat$y) * noise_level), replace = FALSE)
+  dat$y[flip_indices] = 1 - dat$y[flip_indices]  # Flip the y values at these indices
+  
+  # IR
+  print(table(dat$y))
+  print(c("IR before noise", table(dat$y)[1] / table(dat$y)[2]))
+
+  gam.plot(dat$x, dat$y, dat$x, dat$y)
+  
+  
+  
+  
+}
+
+
+```
+
+## 2.2 HadCRUT dataset
+
+```{r}
+if(data.selection == 2) {
+  # setwd("~/OneDrive - University of Missouri/01_Mizzou/00_Research/08_2020 Active downsampling with Non-linearity/R/01_Nonparametric Logistic regression/data")
+  
+  setwd("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/data/HadCRUT")
+  
+  dat = read.csv("HadCRUT.csv", header = FALSE, stringsAsFactors = FALSE)
+  dat$V1[1] = 1850
+  gtemp = data.frame("Year" = as.numeric(dat$V1), "Temperature" = dat$V2)
+  head(gtemp)
+  
+  # par(mfrow = c(1,2))
+  
+  ###############################
+  # Regression with mgcv::gam() #
+  ###############################
+  # pdf(file = "motivation-1.pdf")
+  # win.metafile(file = "motivation_1.wmf")
+  gam.plot(gtemp$Year, gtemp$Temperature, gtemp$Year, gtemp$Temperature, type = "gaussian", title = "")
+  
+  ###############################
+  # Linear Regression with lm() #
+  ###############################
+  # pdf(file = "motivation-2.pdf")
+  # win.metafile(file = "motivation_2.wmf")
+  glm.plot(gtemp$Year, gtemp$Temperature, gtemp$Year, gtemp$Temperature, type = "gaussian", title = "")
+  
+  ###################################
+  # Classification with mgcv::gam() #
+  ###################################
+  # pdf(file = "motivation-3.pdf")
+  # win.metafile(file = "motivation_3.wmf")
+  gam.plot(gtemp$Year, I(gtemp$Temperature>0), gtemp$Year, I(gtemp$Temperature>0), type = "binomial", title = "")
+  
+  #############################
+  # Classification with glm() #
+  #############################
+  # pdf(file = "motivation-4.pdf")
+  # win.metafile(file = "motivation_4.wmf")
+  glm.plot(gtemp$Year, I(gtemp$Temperature>0), gtemp$Year, I(gtemp$Temperature>0), type = "binomial", title = "")
+  
+  # dev.off()
+  
+  ##################################
+  # Comparison between GAM and GLM #
+  ##################################
+  
+  # 1. regression
+  my.gam <- mgcv::gam(Temperature ~ s(Year, fx = FALSE, bs = "tp", m = 2, k = 100), data = gtemp, method = 'REML', family = gaussian)
+  my.lm = lm(Temperature ~ Year, data = gtemp)
+  pred.lm = predict(my.lm, newdata = list(Year = gtemp$Year), se=TRUE)
+  
+  anova(my.lm, my.gam)
+  
+  # 2. classification
+  my.gam.lr <- mgcv::gam(I(Temperature>0) ~ s(Year, fx = FALSE, bs = "tp", m = 2, k = 10), data = gtemp, method = 'REML', family = binomial)
+  my.glm.lr = glm(I(Temperature>0) ~ Year, data = gtemp, family = binomial)
+  
+  
+  # check the significance with Deviance
+  # https://stats.stackexchange.com/questions/44581/analysis-of-deviance-in-r-which-test
+  
+  anova(my.glm.lr, my.gam.lr)
+  anova(my.glm.lr, my.gam.lr, test = "Chisq")
+  
+  # p-value when it comes to Deviance
+  1 - pchisq(q = 35.442, df = 4.8158, lower.tail = TRUE)
+  # 9.97931e-07
+  
+  ######################################################
+  ### Augmentation for majority samples (172 -> 1720) ##         ######################################################
+  ### It shows the problem with bias towards the majority samples.
+
+  # IR when balanced
+  sum(gtemp$Temperature <= 0) /sum(gtemp$Temperature > 0)
+  
+  # augment data (gtemp (172) -> dat (1720))
+  dat = as.data.frame(gtemp[rep(seq_len(nrow(gtemp)), times = 10),])
+  # dat = as.data.frame(gtemp)
+  set.seed(my.seed)
+  dat$Year = jitter(dat$Year)
+  dat$Temperature[dat$Temperature > 0] = 1
+  dat$Temperature[dat$Temperature <= 0] = 0
+  
+  # par(mfrow = c(1,2))
+  # IR
+  print(c("IR with Full set", table(dat$Temperature)[1] / table(dat$Temperature)[2]))
+  
+  # pdf(file = "imbalance-1.pdf")
+  # win.metafile(file = "imbalance_1.wmf")
+  dat.order = dat[order(dat$Year),]
+  gam.plot(dat.order$Year,dat.order$Temperature, dat.order$Year, dat.order$Temperature, bs = "cr", type = "binomial", title = "")
+  # dev.off()
+  
+  ##############
+  # Control IR #
+  ##############
+  ind = sample(which(dat$Temperature == 1), sum(dat$Temperature == 1)* 0.85, replace = FALSE)
+  dat = dat[-ind,]
+  
+  # IR
+  print(c("IR with imbalanced set", table(dat$Temperature)[1] / table(dat$Temperature)[2]))
+  
+  # pdf(file = "imbalance-2.pdf")
+  # win.metafile(file = "imbalance_2.wmf")
+  dat.order = dat[order(dat$Year),]
+  gam.plot(dat.order$Year,dat.order$Temperature, dat.order$Year, dat.order$Temperature, bs = "cr", type = "binomial", title = "")
+  # dev.off()
+
+}
+```
+
+
+
+## 2.3 South African Heart Disease
+"sbp"          "tobacco"      "ldl"          "adiposity"   
+ [6] "famhist"      "typea"        "obesity"      "alcohol"      "age"         
+[11] "chd"  
+```{r}
+if(data.selection == 3) {
+
+  setwd("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/data/SAheart")
+  
+  dat = read.csv("SAheart.csv", header = TRUE, stringsAsFactors = FALSE)
+  head(dat)
+
+  dat.order = dat[order(dat$typea),]
+  X_train = dat.order$typea
+  y_train = I(dat.order$chd)
+  
+  ###################################
+  # Classification with mgcv::gam() #
+  ###################################
+  # pdf(file = "motivation-3.pdf")
+  # win.metafile(file = "motivation_3.wmf")
+  gam.plot(X_train, y_train, X_train, y_train, type = "binomial", title = "")
+  
+  #############################
+  # Classification with glm() #
+  #############################
+  # pdf(file = "motivation-4.pdf")
+  # win.metafile(file = "motivation_4.wmf")
+  glm.plot(X_train, y_train, X_train, y_train, type = "binomial", title = "")
+  
+  gtemp = data.frame(x = X_train, y = as.integer(y_train))
+  
+  # dev.off()
+
+  # IR when balanced
+  
+  print(c("Original IR = ", table(gtemp$y)[1] / table(gtemp$y)[2]))
+  
+  
+  # Augmentation of data
+  
+  dat = as.data.frame(gtemp[rep(seq_len(nrow(gtemp)), times = 10),])
+  
+  print(str(gtemp))
+  print(str(dat))
+  
+  set.seed(my.seed)
+  dat$x = jitter(dat$x)
+  
+  # IR
+  print(c("IR with Full set", table(dat$y)[1] / table(dat$y)[2]))
+  
+  ##############
+  # Control IR #
+  ##############
+  ind = sample(which(dat$y == 1), sum(dat$y == 1)* 0.70, replace = FALSE)
+  dat = dat[-ind,]
+  
+  
+  # IR
+  print(c(table(dat$y)[1], table(dat$y)[2]))
+  print(c("IR with imbalanced set", table(dat$y)[1] / table(dat$y)[2]))
+  
+  
+  # pdf(file = "imbalance-2.pdf")
+  # win.metafile(file = "imbalance_2.wmf")
+  dat.order = dat[order(dat$x),]
+  gam.plot(dat.order$x,dat.order$y, dat.order$x, dat.order$y, bs = "cr", type = "binomial", title = "")
+  # dev.off()
+}
+
+```
+
+## 2.4 Abalone
+```{r}
+if(data.selection == 4) {
+  setwd("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/data/abalone")
+  
+  
+  ab = read.table("abalone.data", sep = ",")
+  # str(ab)
+  # unique(ab$V1)
+  
+  # transform char to numeric
+  # ab$V1[ab$V1 == "M"] = 1
+  # ab$V1[ab$V1 == "F"] = 2
+  # ab$V1[ab$V1 == "I"] = 3
+  ab$V1 = as.factor(ab$V1)
+  
+  # select class of '18' & '9'
+  ab.sel = ab[((ab$V9 == 18)|(ab$V9 == 9)),]
+  # str(ab.sel)
+  # table(ab.sel$V9)
+  ab.sel$V9[ab.sel$V9 == 18] = 1
+  ab.sel$V9[ab.sel$V9 == 9] = 0
+  # table(ab.sel$V9)
+  
+  # pairs(ab.sel)
+  
+  # output
+  gtemp = data.frame(x = ab.sel$V8, y = as.integer(ab.sel$V9))
+  
+ # IR when balanced
+  
+  print(c("Original IR = ", table(gtemp$y)[1] / table(gtemp$y)[2]))
+  
+  
+    # Augmentation of data
+  
+  dat = as.data.frame(gtemp[rep(seq_len(nrow(gtemp)), times = 2),])
+  
+  print(str(gtemp))
+  print(str(dat))
+  
+  set.seed(my.seed)
+  dat$x = jitter(dat$x)
+  
+  # IR
+  print(c("IR with Full set", table(dat$y)[1] / table(dat$y)[2]))
+  
+}
+```
+
+## 2.5 Pima
+```{r}
+if(data.selection == 5) {
+  
+  setwd("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/data/Pima diabetes")
+  pima = read.csv("pima-indians-diabetes.csv", header = FALSE,
+                  stringsAsFactors = FALSE)
+  
+  (maj = sum(pima$V9==0))
+  (min = sum(pima$V9==1))
+  (IR = maj/min)
+  
+  str(pima)
+  
+  # output
+  gtemp = data.frame(x = pima$V6, y = as.integer(pima$V9))
+  
+ # IR when balanced
+  
+  print(c("Original IR = ", table(gtemp$y)[1] / table(gtemp$y)[2]))
+  
+  
+    # Augmentation of data
+  
+  dat = as.data.frame(gtemp[rep(seq_len(nrow(gtemp)), times = 2),])
+  
+  print(str(gtemp))
+  print(str(dat))
+  
+  set.seed(my.seed)
+  dat$x = jitter(dat$x)
+  
+  # IR
+  print(c("IR with Full set", table(dat$y)[1] / table(dat$y)[2]))
+}
+
+```
+
+#3. Active downsampling (k-CV)
+## 3.1 Active selection
+```{r}
+if (data.selection != 11){
+  set.seed(my.seed)
+  folds = sample(1:k, nrow(dat), replace = TRUE) # replace = TRUE: we can choose the number from 1 to k=10 randomly nrow(dat) times with replacement
+  cv.err.full = list()
+  cv.err.init = list()
+  cv.active.out = list()
+  cv.rand.out = list()
+  loop.k = k
+  cv.count = 0
+  
+  for (j in 1:loop.k) { # k-CV
+    cv.count = cv.count + 1
+    train_full = dat[folds != j, ] 
+    test = dat[folds == j, ]
+    
+    X_train_full = train_full[, 1:(ncol(train_full)-1)]
+    y_train_full = train_full[, ncol(train_full)]
+    X_test = test[,1:(ncol(test)-1)]
+    y_test = test[,ncol(train_full)]
+    
+    #####################################
+    # fit the model to the full dataset #
+    #####################################
+    
+    if (gam.selection == 1 | gam.selection == 3 | gam.selection == 4) { # '|' indicates 'or"
+      #################
+      # gam with full #
+      #################  
+      
+      perf.out.gam.full = gam.perf(X_train_full, y_train_full, X_test, y_test)
+  
+      perf.print("gam with full", perf.out.gam.full)
+      gam.plot(X_train_full, y_train_full, X_test, y_test, bs = bs.in, type = "binomial", title = "GAM with X_train_full")
+  
+      cv.err.full[[cv.count]] = c(perf.out.gam.full[[1]],
+                                  perf.out.gam.full[[2]],
+                                  perf.out.gam.full[[3]],
+                                  perf.out.gam.full[[4]],
+                                  perf.out.gam.full[[5]],
+                                  perf.out.gam.full[[6]],
+                                  perf.out.gam.full[[7]])
+      
+    } else if (gam.selection == 2) {
+        #################
+        # glm with full #
+        #################  
+        
+        perf.out.glm.full = glm.perf(X_train_full, y_train_full, X_test, y_test)
+  
+        perf.print("glm with full", perf.out.glm.full)
+        glm.plot(X_train_full, y_train_full, X_test, y_test, type = "binomial", title = "GLM with X_train_full")
+        
+        cv.err.full[[cv.count]] = c(perf.out.glm.full[[1]],
+                                    perf.out.glm.full[[2]],
+                                    perf.out.glm.full[[3]],
+                                    perf.out.glm.full[[4]],
+                                    perf.out.glm.full[[5]],
+                                    perf.out.glm.full[[6]],
+                                    perf.out.glm.full[[7]])
+    } else if (gam.selection == 5) {
+        #################
+        # Decision Tree #
+        #################
+      
+        perf.out.dt.full = dt.perf(X_train_full, y_train_full, X_test, y_test)
+    
+        perf.print("dt with full", perf.out.dt.full)
+        
+        cv.err.full[[cv.count]] = c(perf.out.dt.full[[1]],
+                                    perf.out.dt.full[[2]],
+                                    perf.out.dt.full[[3]],
+                                    perf.out.dt.full[[4]],
+                                    perf.out.dt.full[[5]],
+                                    perf.out.dt.full[[6]],
+                                    perf.out.dt.full[[7]])
+    } else if (gam.selection == 6) {
+        ########
+        # SVM #
+        #######
+      
+        perf.out.svm.full = svm.perf(X_train_full, y_train_full, X_test, y_test)
+    
+        perf.print("svm with full", perf.out.svm.full)
+        
+        cv.err.full[[cv.count]] = c(perf.out.svm.full[[1]],
+                                    perf.out.svm.full[[2]],
+                                    perf.out.svm.full[[3]],
+                                    perf.out.svm.full[[4]],
+                                    perf.out.svm.full[[5]],
+                                    perf.out.svm.full[[6]],
+                                    perf.out.svm.full[[7]])
+    }
+    
+    
+    ######################
+    # select initial set #
+    ######################
+    initial.out = get_k_random_samples(initial_k, my.seed, X_train_full, y_train_full)
+  
+    X_train = initial.out[[1]]
+    y_train = initial.out[[2]]
+    X_val = initial.out[[3]]
+    y_val = initial.out[[4]]
+    
+    print(c("Initial out",length(X_train), length(y_train), length(X_val), length(y_val)))
+    
+    #################################
+    # initial model with            #
+    #   1. gam (gam.selection == 1) #
+    #   2. glm (gam.selection == 2) #
+    #################################  
+    
+    if (gam.selection == 1 | gam.selection == 3 | gam.selection == 4) {
+  
+    perf.out.gam.init = gam.perf(X_train, y_train, X_test, y_test)
+    # perf.print("Initial with gam", perf.out.gam.init)
+    # gam.plot(X_train, y_train, X_test, y_test)
+    
+    cv.err.init[[cv.count]] = c(perf.out.gam.init[[1]], 
+                                perf.out.gam.init[[2]], 
+                                perf.out.gam.init[[3]], 
+                                perf.out.gam.init[[4]], 
+                                perf.out.gam.init[[5]], 
+                                perf.out.gam.init[[6]], 
+                                perf.out.gam.init[[7]])
+    
+    } else if (gam.selection == 2) {
+  
+      perf.out.glm.init = glm.perf(X_train, y_train, X_test, y_test)
+      # perf.print("Initial with gam", perf.out.glm.init)
+      # glm.plot(X_train, y_train, X_test, y_test)
+      
+      cv.err.init[[cv.count]] = c(perf.out.glm.init[[1]],
+                                  perf.out.glm.init[[2]],
+                                  perf.out.glm.init[[3]],
+                                  perf.out.glm.init[[4]],
+                                  perf.out.glm.init[[5]],
+                                  perf.out.glm.init[[6]],
+                                  perf.out.glm.init[[7]])
+    } else if (gam.selection ==5) {
+  
+      perf.out.dt.init = dt.perf(X_train, y_train, X_test, y_test)
+      # perf.print("Initial with gam", perf.out.glm.init)
+      # glm.plot(X_train, y_train, X_test, y_test)
+      
+      cv.err.init[[cv.count]] = c(perf.out.dt.init[[1]],
+                                  perf.out.dt.init[[2]],
+                                  perf.out.dt.init[[3]],
+                                  perf.out.dt.init[[4]],
+                                  perf.out.dt.init[[5]],
+                                  perf.out.dt.init[[6]],
+                                  perf.out.dt.init[[7]])
+    } else if (gam.selection ==6) {
+  
+      perf.out.svm.init = svm.perf(X_train, y_train, X_test, y_test)
+      # perf.print("Initial with gam", perf.out.glm.init)
+      # glm.plot(X_train, y_train, X_test, y_test)
+      
+      cv.err.init[[cv.count]] = c(perf.out.svm.init[[1]],
+                                  perf.out.svm.init[[2]],
+                                  perf.out.svm.init[[3]],
+                                  perf.out.svm.init[[4]],
+                                  perf.out.svm.init[[5]],
+                                  perf.out.svm.init[[6]],
+                                  perf.out.svm.init[[7]])
+    }
+    
+    ####################
+    # Active selection #
+    ####################
+    
+    print("Active selection")
+    if (gam.selection == 1) {
+      active.out = gam.active(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+    } else if (gam.selection == 2) {
+      active.out = glm.active(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+    } else if (gam.selection == 3) {
+      print("gam with D-optimality")
+      active.out = gam.active.opt(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+    } else if (gam.selection == 4) {
+      active.out = gam.active.perf(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+    } else if (gam.selection == 5) {
+      active.out = dt.active.perf(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+    } else if (gam.selection == 6) {
+      active.out = svm.active.perf(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+    }
+    
+    cv.active.out[[cv.count]] = active.out
+    
+    ####################
+    # Random selection #
+    ####################
+    
+    if (rand.selection == 1) {
+      print("Random selection: GAM")
+      rand.out = gam.random(X_train, y_train, X_val, y_val, X_test, y_test, repeats, my.seed)
+      cv.rand.out[[cv.count]] = rand.out    
+    } else if (rand.selection == 2) {
+      print("Random selection: GLM")
+      rand.out = glm.random(X_train, y_train, X_val, y_val, X_test, y_test, repeats, my.seed)
+      cv.rand.out[[cv.count]] = rand.out    
+    }
+    
+    print(c("============= the number of CV  ===============", cv.count))
+  }
+}
+```
+
+## IR effect
+```{r}
+if (data.selection == 11){
+  dat = dat_IR[[z]]
+  set.seed(my.seed)
+  folds = sample(1:k, nrow(dat), replace = TRUE) # replace = TRUE: we can choose the number from 1 to k=10 randomly nrow(dat) times with replacement
+  cv.err.full = list()
+  cv.err.init = list()
+  cv.active.out = list()
+  cv.rand.out = list()
+  loop.k = k
+  cv.count = 0
+  cv.active.out.IR = list()
+  
+    for (j in 1:loop.k) { # k-CV
+      cv.count = cv.count + 1
+      train_full = dat[folds != j, ] 
+      test = dat[folds == j, ]
+      
+      X_train_full = train_full[, 1:(ncol(train_full)-1)]
+      y_train_full = train_full[, ncol(train_full)]
+      X_test = test[,1:(ncol(test)-1)]
+      y_test = test[,ncol(train_full)]
+      
+      #####################################
+      # fit the model to the full dataset #
+      #####################################
+      
+      if (gam.selection == 1 | gam.selection == 3 | gam.selection == 4) { # '|' indicates 'or"
+        #################
+        # gam with full #
+        #################  
+        
+        perf.out.gam.full = gam.perf(X_train_full, y_train_full, X_test, y_test)
+    
+        perf.print("gam with full", perf.out.gam.full)
+        gam.plot(X_train_full, y_train_full, X_test, y_test, bs = bs.in, type = "binomial", title = "GAM with X_train_full")
+    
+        cv.err.full[[cv.count]] = c(perf.out.gam.full[[1]],
+                                    perf.out.gam.full[[2]],
+                                    perf.out.gam.full[[3]],
+                                    perf.out.gam.full[[4]],
+                                    perf.out.gam.full[[5]],
+                                    perf.out.gam.full[[6]],
+                                    perf.out.gam.full[[7]])
+        
+      } else if (gam.selection == 2) {
+          #################
+          # glm with full #
+          #################  
+          
+          perf.out.glm.full = glm.perf(X_train_full, y_train_full, X_test, y_test)
+    
+          perf.print("glm with full", perf.out.glm.full)
+          glm.plot(X_train_full, y_train_full, X_test, y_test, type = "binomial", title = "GLM with X_train_full")
+          
+          cv.err.full[[cv.count]] = c(perf.out.glm.full[[1]],
+                                      perf.out.glm.full[[2]],
+                                      perf.out.glm.full[[3]],
+                                      perf.out.glm.full[[4]],
+                                      perf.out.glm.full[[5]],
+                                      perf.out.glm.full[[6]],
+                                      perf.out.glm.full[[7]])
+      } else if (gam.selection == 5) {
+          #################
+          # Decision Tree #
+          #################
+        
+          perf.out.dt.full = dt.perf(X_train_full, y_train_full, X_test, y_test)
+      
+          perf.print("dt with full", perf.out.dt.full)
+          
+          cv.err.full[[cv.count]] = c(perf.out.dt.full[[1]],
+                                      perf.out.dt.full[[2]],
+                                      perf.out.dt.full[[3]],
+                                      perf.out.dt.full[[4]],
+                                      perf.out.dt.full[[5]],
+                                      perf.out.dt.full[[6]],
+                                      perf.out.dt.full[[7]])
+      } else if (gam.selection == 6) {
+          ########
+          # SVM #
+          #######
+        
+          perf.out.svm.full = svm.perf(X_train_full, y_train_full, X_test, y_test)
+      
+          perf.print("svm with full", perf.out.svm.full)
+          
+          cv.err.full[[cv.count]] = c(perf.out.svm.full[[1]],
+                                      perf.out.svm.full[[2]],
+                                      perf.out.svm.full[[3]],
+                                      perf.out.svm.full[[4]],
+                                      perf.out.svm.full[[5]],
+                                      perf.out.svm.full[[6]],
+                                      perf.out.svm.full[[7]])
+      }
+      
+      
+      ######################
+      # select initial set #
+      ######################
+      initial.out = get_k_random_samples(initial_k, my.seed, X_train_full, y_train_full)
+    
+      X_train = initial.out[[1]]
+      y_train = initial.out[[2]]
+      X_val = initial.out[[3]]
+      y_val = initial.out[[4]]
+      
+      print(c("Initial out",length(X_train), length(y_train), length(X_val), length(y_val)))
+      
+      #################################
+      # initial model with            #
+      #   1. gam (gam.selection == 1) #
+      #   2. glm (gam.selection == 2) #
+      #################################  
+      
+      if (gam.selection == 1 | gam.selection == 3 | gam.selection == 4) {
+    
+      perf.out.gam.init = gam.perf(X_train, y_train, X_test, y_test)
+      # perf.print("Initial with gam", perf.out.gam.init)
+      # gam.plot(X_train, y_train, X_test, y_test)
+      
+      cv.err.init[[cv.count]] = c(perf.out.gam.init[[1]], 
+                                  perf.out.gam.init[[2]], 
+                                  perf.out.gam.init[[3]], 
+                                  perf.out.gam.init[[4]], 
+                                  perf.out.gam.init[[5]], 
+                                  perf.out.gam.init[[6]], 
+                                  perf.out.gam.init[[7]])
+      
+      } else if (gam.selection == 2) {
+    
+        perf.out.glm.init = glm.perf(X_train, y_train, X_test, y_test)
+        # perf.print("Initial with gam", perf.out.glm.init)
+        # glm.plot(X_train, y_train, X_test, y_test)
+        
+        cv.err.init[[cv.count]] = c(perf.out.glm.init[[1]],
+                                    perf.out.glm.init[[2]],
+                                    perf.out.glm.init[[3]],
+                                    perf.out.glm.init[[4]],
+                                    perf.out.glm.init[[5]],
+                                    perf.out.glm.init[[6]],
+                                    perf.out.glm.init[[7]])
+      } else if (gam.selection ==5) {
+    
+        perf.out.dt.init = dt.perf(X_train, y_train, X_test, y_test)
+        # perf.print("Initial with gam", perf.out.glm.init)
+        # glm.plot(X_train, y_train, X_test, y_test)
+        
+        cv.err.init[[cv.count]] = c(perf.out.dt.init[[1]],
+                                    perf.out.dt.init[[2]],
+                                    perf.out.dt.init[[3]],
+                                    perf.out.dt.init[[4]],
+                                    perf.out.dt.init[[5]],
+                                    perf.out.dt.init[[6]],
+                                    perf.out.dt.init[[7]])
+      } else if (gam.selection ==6) {
+    
+        perf.out.svm.init = svm.perf(X_train, y_train, X_test, y_test)
+        # perf.print("Initial with gam", perf.out.glm.init)
+        # glm.plot(X_train, y_train, X_test, y_test)
+        
+        cv.err.init[[cv.count]] = c(perf.out.svm.init[[1]],
+                                    perf.out.svm.init[[2]],
+                                    perf.out.svm.init[[3]],
+                                    perf.out.svm.init[[4]],
+                                    perf.out.svm.init[[5]],
+                                    perf.out.svm.init[[6]],
+                                    perf.out.svm.init[[7]])
+      }
+      
+      ####################
+      # Active selection #
+      ####################
+      
+      print("Active selection")
+      if (gam.selection == 1) {
+        active.out = gam.active(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+      } else if (gam.selection == 2) {
+        active.out = glm.active(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+      } else if (gam.selection == 3) {
+        print("gam with D-optimality")
+        active.out = gam.active.opt(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+      } else if (gam.selection == 4) {
+        active.out = gam.active.perf(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+      } else if (gam.selection == 5) {
+        active.out = dt.active.perf(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+      } else if (gam.selection == 6) {
+        active.out = svm.active.perf(X_train, y_train, X_val, y_val, X_test, y_test, repeats)
+      }
+      
+      cv.active.out[[cv.count]] = active.out
+    }
+    cv.active.out.IR[[z]] = cv.active.out
+}
+```
+
+
+## 3.2 Performance plot between Active selection vs Random selection
+
+```{r}
+# merge k-fold output to single output
+
+error.test.active = k.fold.merge(cv.err.init, cv.active.out, loop.k, cv.err.full)
+error.test.rand = k.fold.merge(cv.err.init, cv.rand.out, loop.k, cv.err.full)
+
+ylim.vector = c("rand", "active", # accuracy: ylim(c(minimum, maximum))
+                "rand", "active", # F-measure: ylim(c(minimum, maximum))
+                "rand", "active", # G-mean: ylim(c(minimum, maximum))
+                "rand", "active", # AUC: ylim(c(minimum, maximum))
+                "rand", "active", # AUC-PR: ylim(c(minimum, maximum))
+                "rand", "active", # TPrate
+                "rand", "active") # TNrate
+
+perf.plot(error.test.active[[1]], error.test.rand[[1]], length, error.test.active[[2]], ylim.vector)
+```
+
+```{r}
+range(error.test.active[[1]][1:(1 + length),1])
+range(error.test.active[[1]][1:(1 + length),2])
+range(error.test.active[[1]][1:(1 + length),3])
+range(error.test.active[[1]][1:(1 + length),4])
+range(error.test.active[[1]][1:(1 + length),5])
+range(error.test.active[[1]][1:(1 + length),6])
+range(error.test.active[[1]][1:(1 + length),7])
+
+range(error.test.rand[[1]][1:(1 + length),1])
+range(error.test.rand[[1]][1:(1 + length),2])
+range(error.test.rand[[1]][1:(1 + length),3])
+range(error.test.rand[[1]][1:(1 + length),4])
+range(error.test.rand[[1]][1:(1 + length),5])
+range(error.test.rand[[1]][1:(1 + length),6])
+range(error.test.rand[[1]][1:(1 + length),7])
+```
+
+
+## 3.3 Comparison for algorithm
+
+### Synthetic data
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1510.RData")
+
+# rand
+plot.out = comp.plot(error.test.rand[[1]], repeats)
+
+err.acc.1 = plot.out[[1]]
+err.F.1 = plot.out[[2]]
+err.Gmean.1 = plot.out[[3]]
+err.AUC.1 = plot.out[[4]]
+err.PR.1 = plot.out[[5]]
+err.TP.1 = plot.out[[6]]
+err.TN.1 = plot.out[[7]]
+
+# active
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.2 = plot.out[[1]]
+err.F.2 = plot.out[[2]]
+err.Gmean.2 = plot.out[[3]]
+err.AUC.2 = plot.out[[4]]
+err.PR.2 = plot.out[[5]]
+err.TP.2 = plot.out[[6]]
+err.TN.2 = plot.out[[7]]
+
+hline.2 = error.test.active[[2]]
+
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1520.RData")
+
+# active
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.3 = plot.out[[1]]
+err.F.3 = plot.out[[2]]
+err.Gmean.3 = plot.out[[3]]
+err.AUC.3 = plot.out[[4]]
+err.PR.3 = plot.out[[5]]
+err.TP.3 = plot.out[[6]]
+err.TN.3 = plot.out[[7]]
+
+hline.3 = error.test.active[[2]]
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1533.RData")
+
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.4 = plot.out[[1]]
+err.F.4 = plot.out[[2]]
+err.Gmean.4 = plot.out[[3]]
+err.AUC.4 = plot.out[[4]]
+err.PR.4 = plot.out[[5]]
+err.TP.4 = plot.out[[6]]
+err.TN.4 = plot.out[[7]]
+
+hline.4 = error.test.active[[2]]
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1532.RData")
+
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.5 = plot.out[[1]]
+err.F.5 = plot.out[[2]]
+err.Gmean.5 = plot.out[[3]]
+err.AUC.5 = plot.out[[4]]
+err.PR.5 = plot.out[[5]]
+err.TP.5 = plot.out[[6]]
+err.TN.5 = plot.out[[7]]
+
+hline.pred = error.test.active[[2]]
+
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1552.RData")
+
+hline.pred = error.test.active[[2]]
+
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.6 = plot.out[[1]]
+err.F.6 = plot.out[[2]]
+err.Gmean.6 = plot.out[[3]]
+err.AUC.6 = plot.out[[4]]
+err.PR.6 = plot.out[[5]]
+err.TP.6 = plot.out[[6]]
+err.TN.6 = plot.out[[7]]
+
+```
+
+
+### section 1
+. comp.plot() function: extract vectors from matrix
+### section 2
+. comp.plot2() function: plot vectors extracted from comp.plot()
+
+```{r}
+x = seq(initial_k, repeats + initial_k)
+y.F = list(err.F.1, 
+           err.F.2, 
+           err.F.3, 
+           err.F.4, 
+           err.F.5,
+           err.F.6)
+y.Gmean = list(err.Gmean.1, 
+               err.Gmean.2, 
+               err.Gmean.3,  
+               err.Gmean.4, 
+               err.Gmean.5,
+               err.Gmean.6)
+y.AUC = list(err.AUC.1, 
+               err.AUC.2, 
+               err.AUC.3,  
+               err.AUC.4, 
+               err.AUC.5,
+               err.AUC.6)
+y.PR = list(err.PR.1, 
+             err.PR.2, 
+             err.PR.3,  
+             err.PR.4, 
+             err.PR.5,
+             err.PR.6)
+
+y.TP = list(err.TP.1, 
+             err.TP.2, 
+             err.TP.3,  
+             err.TP.4, 
+             err.TP.5,
+             err.TP.6)
+
+y.TN = list(err.TN.1, 
+             err.TN.2, 
+             err.TN.3,  
+             err.TN.4, 
+             err.TN.5,
+             err.TN.6)
+```
+
+## Synthetic data with 2 glm, 3 gam
+```{r}
+title = c("")
+# label for x, y axis
+label = c("Number of samples", "F-measure", "G-mean", "AUC", "AUC-PR", "TPR", "TNR")
+color = c("black", "orange", "#009900", "blue", "red")
+length = 250
+
+ylim.F = c(min(err.F.1[1:length]),
+         max(err.F.6[1:length]))
+ylim.Gmean = c(min(err.Gmean.1[1:length]),
+             max(err.Gmean.6[1:length]))
+ylim.AUC = c(min(err.AUC.1[1:length]),
+               max(err.AUC.6[1:length]))
+ylim.PR = c(min(err.PR.1[1:length]),
+               max(err.PR.6[1:length]))
+ylim.TP = c(min(err.TP.1[1:length]),
+               max(err.TP.6[1:length]))
+ylim.TN = c(min(err.TN.1[1:length]),
+               max(err.TN.1[1:length]))
+
+pdf(file = "case502.pdf", width = 6, height = 8)
+
+# Set outer margins (oma) for the entire plot
+# c(bottom, left, top, right)
+par(oma = c(2,0,0,0))
+
+# Set up a 3x2 layout for the plots
+par(mfrow = c(3, 2))
+
+# Set inner margins (mar) for individual plots
+# c(bottom, left, top, right)
+par(mar = c(4.1, 4.1, 1.1, 1.1))
+
+### TPrate ###
+comp.plot2(x, length, y1 = y.TP[[1]], y2 = y.TP[[2]], y3 = y.TP[[4]], y4 = y.TP[[5]], y5 = y.TP[[6]], "", ylim.TP[1:2], title, label[c(1,6)], color)
+
+### TNrate ###
+comp.plot2(x, length, y1 = y.TN[[1]], y2 = y.TN[[2]], y3 = y.TN[[4]], y4 = y.TN[[5]], y5 = y.TN[[6]], "", ylim.TN[1:2], title, label[c(1,7)], color)
+
+### F-measure ###
+comp.plot2(x, length, y1 = y.F[[1]], y2 = y.F[[2]], y3 = y.F[[4]], y4 = y.F[[5]], y5 = y.F[[6]], "", ylim.F[1:2], title, label[c(1,2)], color)
+
+### Gmean ###
+comp.plot2(x, length, y1 = y.Gmean[[1]], y2 = y.Gmean[[2]], y3 = y.Gmean[[4]], y4 = y.Gmean[[5]], y5 = y.Gmean[[6]], "", ylim.Gmean[1:2], title, label[c(1,3)], color)
+
+### AUC ###
+comp.plot2(x, length, y1 = y.AUC[[1]], y2 = y.AUC[[2]], y3 = y.AUC[[4]], y4 = y.AUC[[5]], y5 = y.AUC[[6]], "", ylim.AUC[1:2], title, label[c(1,4)], color)
+
+### AUC-PR ###
+comp.plot2(x, length, y1 = y.PR[[1]], y2 = y.PR[[2]], y3 = y.PR[[4]], y4 = y.PR[[5]], y5 = y.PR[[6]], "", ylim.PR[1:2], title, label[c(1,5)], color)
+
+
+
+## legend
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n")
+legend("bottom",  xpd = TRUE, horiz = TRUE, inset = c(0, 0),
+       legend = c("Linear (Rand)", "Linear (Margin)", "Nonlinear (D-Opt)", "Nonlinear (A-Opt)", "Nonlinear (Proposed)"),
+       col = c("black", "orange", "#009900", "blue", "red"),
+       fill=c("black", "orange", "#009900", "blue", "red"),
+       bg = "white", cex = 0.7)
+dev.off()
+
+```
+
+## case502-1 (only gam)
+```{r}
+ylim.F = c(min(err.F.4[1:length]),
+         max(err.F.6[1:length]))
+ylim.Gmean = c(min(err.Gmean.4[1:length]),
+             max(err.Gmean.6[1:length]))
+ylim.AUC = c(min(err.AUC.4[1:length]),
+            max(err.AUC.6[1:length]))
+ylim.PR = c(min(err.PR.4[1:length]),
+               max(err.PR.6[1:length]))
+ylim.TP = c(min(err.TP.4[1:length]),
+               max(err.TP.6[1:length]))
+ylim.TN = c(min(err.TN.6[1:length]),
+               max(err.TN.4[1:length]))
+
+
+pdf(file = "case502-1.pdf", width = 6, height = 8)
+
+# Set outer margins (oma) for the entire plot
+# c(bottom, left, top, right)
+par(oma = c(2,0,0,0))
+
+# Set up a 3x2 layout for the plots
+par(mfrow = c(3, 2))
+
+# Set inner margins (mar) for individual plots
+# c(bottom, left, top, right)
+par(mar = c(4.1, 4.1, 1.1, 1.1))
+
+### TPrate ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.TP[[4]], y4 = y.TP[[5]], y5 = y.TP[[6]], "", ylim.TP[1:2], title, label[c(1,6)], color)
+
+### TNrate ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.TN[[4]], y4 = y.TN[[5]], y5 = y.TN[[6]], "", ylim.TN[1:2], title, label[c(1,7)], color)
+
+### F measure ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.F[[4]], y4 = y.F[[5]], y5 = y.F[[6]], "", ylim.F[1:2], title, label[c(1,2)], color)
+
+### Gmean ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.Gmean[[4]], y4 = y.Gmean[[5]], y5 = y.Gmean[[6]], "", ylim.Gmean[1:2], title, label[c(1,3)], color)
+
+### AUC ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.AUC[[4]], y4 = y.AUC[[5]], y5 = y.AUC[[6]], "", ylim.AUC[1:2], title, label[c(1,4)], color)
+
+### AUC-PR ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.PR[[4]], y4 = y.PR[[5]], y5 = y.PR[[6]], "", ylim.PR[1:2], title, label[c(1,5)], color)
+
+
+
+## legend
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n")
+legend("bottom",  xpd = TRUE, horiz = TRUE, inset = c(0, 0),
+       legend = c("Nonlinear (D-Opt)", "Nonlinear (A-Opt)", "Nonlinear (Proposed)"),
+       col = c("#009900", "blue", "red"),
+       fill=c("#009900", "blue", "red"),
+       bg = "white", cex = 0.7)
+dev.off()
+
+```
+
+## HadCRUT
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1610.RData")
+
+# rand
+plot.out = comp.plot(error.test.rand[[1]], repeats)
+
+err.acc.1 = plot.out[[1]]
+err.F.1 = plot.out[[2]]
+err.Gmean.1 = plot.out[[3]]
+err.AUC.1 = plot.out[[4]]
+err.PR.1 = plot.out[[5]]
+err.TP.1 = plot.out[[6]]
+err.TN.1 = plot.out[[7]]
+
+# active
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.2 = plot.out[[1]]
+err.F.2 = plot.out[[2]]
+err.Gmean.2 = plot.out[[3]]
+err.AUC.2 = plot.out[[4]]
+err.PR.2 = plot.out[[5]]
+err.TP.2 = plot.out[[6]]
+err.TN.2 = plot.out[[7]]
+
+hline.2 = error.test.active[[2]]
+
+
+# load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1620.RData")
+
+# active
+# plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.3 = c()
+err.F.3 = c()
+err.Gmean.3 = c()
+err.AUC.3 = c()
+err.PR.3 = c()
+err.TP.3 = c()
+err.TN.3 = c()
+
+hline.3 = c()
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1633.RData")
+
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.4 = plot.out[[1]]
+err.F.4 = plot.out[[2]]
+err.Gmean.4 = plot.out[[3]]
+err.AUC.4 = plot.out[[4]]
+err.PR.4 = plot.out[[5]]
+err.TP.4 = plot.out[[6]]
+err.TN.4 = plot.out[[7]]
+
+hline.4 = error.test.active[[2]]
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1632.RData")
+
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.5 = plot.out[[1]]
+err.F.5 = plot.out[[2]]
+err.Gmean.5 = plot.out[[3]]
+err.AUC.5 = plot.out[[4]]
+err.PR.5 = plot.out[[5]]
+err.TP.5 = plot.out[[6]]
+err.TN.5 = plot.out[[7]]
+
+hline.pred = error.test.active[[2]]
+
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1652.RData")
+
+hline.pred = error.test.active[[2]]
+
+plot.out = comp.plot(error.test.active[[1]], repeats)
+
+err.acc.6 = plot.out[[1]]
+err.F.6 = plot.out[[2]]
+err.Gmean.6 = plot.out[[3]]
+err.AUC.6 = plot.out[[4]]
+err.PR.6 = plot.out[[5]]
+err.TP.6 = plot.out[[6]]
+err.TN.6 = plot.out[[7]]
+
+```
+
+
+### section 1
+. comp.plot() function: extract vectors from matrix
+### section 2
+. comp.plot2() function: plot vectors extracted from comp.plot()
+
+```{r}
+x = seq(initial_k, repeats + initial_k)
+y.F = list(err.F.1, 
+           err.F.2, 
+           err.F.3, 
+           err.F.4, 
+           err.F.5,
+           err.F.6)
+y.Gmean = list(err.Gmean.1, 
+               err.Gmean.2, 
+               err.Gmean.3,  
+               err.Gmean.4, 
+               err.Gmean.5,
+               err.Gmean.6)
+y.AUC = list(err.AUC.1, 
+               err.AUC.2, 
+               err.AUC.3,  
+               err.AUC.4, 
+               err.AUC.5,
+               err.AUC.6)
+y.PR = list(err.PR.1, 
+             err.PR.2, 
+             err.PR.3,  
+             err.PR.4, 
+             err.PR.5,
+             err.PR.6)
+
+y.TP = list(err.TP.1, 
+             err.TP.2, 
+             err.TP.3,  
+             err.TP.4, 
+             err.TP.5,
+             err.TP.6)
+
+y.TN = list(err.TN.1, 
+             err.TN.2, 
+             err.TN.3,  
+             err.TN.4, 
+             err.TN.5,
+             err.TN.6)
+```
+
+## HadCRUT data with 2 glm, 3 gam
+```{r}
+title = c("")
+# label for x, y axis
+label = c("Number of samples", "F-measure", "G-mean", "AUC", "AUC-PR","TPR", "TNR")
+color = c("black", "orange", "#009900", "blue", "red")
+length = 250
+
+ylim.F = c(min(err.F.1[1:length]),
+         max(err.F.6[1:length]))
+ylim.Gmean = c(min(err.Gmean.1[1:length]),
+             max(err.Gmean.6[1:length]))
+ylim.AUC = c(min(err.AUC.1[1:length]),
+               max(err.AUC.6[1:length]))
+ylim.PR = c(min(err.PR.1[1:length]),
+               max(err.PR.6[1:length]))
+ylim.TP = c(min(err.TP.2[1:length]),
+               max(err.TP.1[1:length]))
+ylim.TN = c(min(err.TN.6[1:length]),
+               max(err.TN.6[1:length]))
+
+pdf(file = "case602.pdf", width = 6, height = 8)
+
+# Set outer margins (oma) for the entire plot
+# c(bottom, left, top, right)
+par(oma = c(2,0,0,0))
+
+# Set up a 3x2 layout for the plots
+par(mfrow = c(3, 2))
+
+# Set inner margins (mar) for individual plots
+# c(bottom, left, top, right)
+par(mar = c(4.1, 4.1, 1.1, 1.1))
+
+### TPrate ###
+comp.plot2(x, length, y1 = y.TP[[1]], y2 = y.TP[[2]], y3 = y.TP[[4]], y4 = y.TP[[5]], y5 = y.TP[[6]], "", ylim.TP[1:2], title, label[c(1,6)], color)
+
+### TNrate ###
+comp.plot2(x, length, y1 = y.TN[[1]], y2 = y.TN[[2]], y3 = y.TN[[4]], y4 = y.TN[[5]], y5 = y.TN[[6]], "", ylim.TN[1:2], title, label[c(1,7)], color)
+
+### F-measure ###
+comp.plot2(x, length, y1 = y.F[[1]], y2 = y.F[[2]], y3 = y.F[[4]], y4 = y.F[[5]], y5 = y.F[[6]], "", ylim.F[1:2], title, label[c(1,2)], color)
+
+### Gmean ###
+comp.plot2(x, length, y1 = y.Gmean[[1]], y2 = y.Gmean[[2]], y3 = y.Gmean[[4]], y4 = y.Gmean[[5]], y5 = y.Gmean[[6]], "", ylim.Gmean[1:2], title, label[c(1,3)], color)
+
+### AUC ###
+comp.plot2(x, length, y1 = y.AUC[[1]], y2 = y.AUC[[2]], y3 = y.AUC[[4]], y4 = y.AUC[[5]], y5 = y.AUC[[6]], "", ylim.AUC[1:2], title, label[c(1,4)], color)
+
+### AUC-PR ###
+comp.plot2(x, length, y1 = y.PR[[1]], y2 = y.PR[[2]], y3 = y.PR[[4]], y4 = y.PR[[5]], y5 = y.PR[[6]], "", ylim.PR[1:2], title, label[c(1,5)], color)
+
+
+## legend
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n")
+legend("bottom",  xpd = TRUE, horiz = TRUE, inset = c(0, 0),
+       legend = c("Linear (Rand)", "Linear (Margin)", "Nonlinear (D-Opt)", "Nonlinear (A-Opt)", "Nonlinear (Proposed)"),
+       col = c("black", "orange", "#009900", "blue", "red"),
+       fill=c("black", "orange", "#009900", "blue", "red"),
+       bg = "white", cex = 0.7)
+dev.off()
+
+```
+
+## case602-1 (only gam)
+```{r}
+ylim.TP = c(0.55,
+               0.95)
+ylim.TN = c(min(err.TN.6[1:length]),
+               max(err.TN.4[1:length]))
+ylim.F = c(min(err.F.4[1:length]),
+         max(err.F.6[1:length]))
+ylim.Gmean = c(min(err.Gmean.5[1:length]),
+             max(err.Gmean.6[1:length]))
+ylim.AUC = c(min(err.AUC.4[1:length]),
+            max(err.AUC.6[1:length]))
+ylim.PR = c(min(err.PR.4[1:length]),
+               max(err.PR.6[1:length]))
+
+pdf(file = "case602-1.pdf", width = 6, height = 8)
+
+# Set outer margins (oma) for the entire plot
+# c(bottom, left, top, right)
+par(oma = c(2,0,0,0))
+
+# Set up a 3x2 layout for the plots
+par(mfrow = c(3, 2))
+
+# Set inner margins (mar) for individual plots
+# c(bottom, left, top, right)
+par(mar = c(4.1, 4.1, 1.1, 1.1))
+
+### TPrate ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.TP[[4]], y4 = y.TP[[5]], y5 = y.TP[[6]], "", ylim.TP[1:2], title, label[c(1,6)], color)
+
+### TNrate ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.TN[[4]], y4 = y.TN[[5]], y5 = y.TN[[6]], "", ylim.TN[1:2], title, label[c(1,7)], color)
+
+### F measure ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.F[[4]], y4 = y.F[[5]], y5 = y.F[[6]], "", ylim.F[1:2], title, label[c(1,2)], color)
+
+### Gmean ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.Gmean[[4]], y4 = y.Gmean[[5]], y5 = y.Gmean[[6]], "", ylim.Gmean[1:2], title, label[c(1,3)], color)
+
+### AUC ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.AUC[[4]], y4 = y.AUC[[5]], y5 = y.AUC[[6]], "", ylim.AUC[1:2], title, label[c(1,4)], color)
+
+### AUC-PR ###
+comp.plot2(x, length, y1 = 0, y2 = 0, y3 = y.PR[[4]], y4 = y.PR[[5]], y5 = y.PR[[6]], "", ylim.PR[1:2], title, label[c(1,5)], color)
+
+
+
+## legend
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n")
+legend("bottom",  xpd = TRUE, horiz = TRUE, inset = c(0, 0),
+       legend = c("Nonlinear (D-Opt)", "Nonlinear (A-Opt)", "Nonlinear (Proposed)"),
+       col = c("#009900", "blue", "red"),
+       fill=c("#009900", "blue", "red"),
+       bg = "white", cex = 0.7)
+dev.off()
+
+```
+
+
+#####################################
+# 10. other downsampling techniques #
+#####################################
+
+## Hyper-parameters for comparison
+
+
+
+## PbAL
+```{r}
+
+if (data.selection == 1){
+      print('synthetic data')
+      if (comp.selection == 1){
+      print('gam')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1552.RData")
+      } else if (comp.selection == 2){
+      print('glm')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1510.RData")  
+      } else if (comp.selection == 3){
+      print('decision tree')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1562.RData")
+      } else if (comp.selection == 4){
+      print('svm')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1572.RData") 
+      }
+} else if (data.selection == 2){
+      print('HadCRUT data')
+      if (comp.selection == 1){
+      print('gam')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1652.RData")
+      } else if (comp.selection == 2){
+      print('glm')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1610.RData")  
+      } else if (comp.selection == 3){
+      print('decision tree')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1662.RData")
+      } else if (comp.selection == 4){
+      print('svm')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1672.RData") 
+      }
+} else if (data.selection == 3){
+      print('Data3')
+      if (comp.selection == 1){
+      print('gam')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1752.RData")
+      } else if (comp.selection == 2){
+      print('glm')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1710.RData")  
+      } else if (comp.selection == 3){
+      print('decision tree')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1762.RData")
+      } else if (comp.selection == 4){
+      print('svm')
+      load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1772.RData") 
+      }
+    }
+```
+
+
+```{r}
+# choose the iteration when f-measure is max
+idx_max = which.max(error.test.active[[1]][,2])
+print(paste("the number of iteration when F-measure is max = ",idx_max))
+# plot(error.test.active[[1]][,2], type = 'l')
+
+numbers = error.test.active[[1]][idx_max,]
+print(c("Output = ", numbers))
+
+# Convert to a single string with tab as delimiter
+numbers_string <- paste(numbers, collapse = "\t")
+
+
+# Copy to clipboard
+writeClipboard(numbers_string)
+```
+
+
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1552-d.RData")
+```
+
+```{r}
+
+# =1 (synthetic), =2 (HadCRUT) = 3 (South Africa), 5 = Pima
+data.selection = 11
+z = 1
+
+# = 1 (apply weight), = 2 (no apply)
+weight.gam.perf = 2 
+
+# =1 (gam, Nonparametric logistic regression), =2 (glm, logistic regression), =3 (decision tree), =4 (SVM)
+comp.selection = 1
+
+my.seed = 1
+```
+
+## 10.1. No downsampling (Performance for original data)
+
+```{r}
+set.seed(my.seed)
+folds = sample(1:k, nrow(dat), replace = TRUE)
+cv.err.orig = matrix(NA, nrow = k, ncol = 7)
+cv.count = 0
+
+for (j in 1:loop.k) {
+# for (j in 1:1) {
+  cv.count = cv.count + 1
+  train_full = dat[folds != j,]
+  test = dat[folds == j,]
+  
+  X_train_full = train_full[, 1:(ncol(train_full)-1)]
+  y_train_full = train_full[,ncol(train_full)]
+  X_test = test[,1:(ncol(test)-1)]
+  y_test = test[,ncol(train_full)]
+  
+  if (comp.selection == 1) {
+    print("gam is used")
+    perf.out.orig = gam.perf(X_train_full, y_train_full, X_test, y_test)
+  } else if (comp.selection == 2) {
+    print("glm is used")
+    perf.out.orig = glm.perf(X_train_full, y_train_full, X_test, y_test)  
+  } else if (comp.selection == 3) {
+    print("Decision Tree is used")
+    perf.out.orig = dt.perf(X_train_full, y_train_full, X_test, y_test) 
+  } else if (comp.selection == 4) {
+    print("svm is used")
+    perf.out.orig = svm.perf(X_train_full, y_train_full, X_test, y_test) 
+  }
+  
+  cv.err.orig[j,1] = perf.out.orig[[1]]
+  cv.err.orig[j,2] = perf.out.orig[[2]]
+  cv.err.orig[j,3] = perf.out.orig[[3]]
+  cv.err.orig[j,4] = perf.out.orig[[4]]
+  cv.err.orig[j,5] = perf.out.orig[[5]]
+  cv.err.orig[j,6] = perf.out.orig[[6]]
+  cv.err.orig[j,7] = perf.out.orig[[7]]
+}
+
+dat.orig = X_train_full
+numbers = cv.err.orig.mean = apply(cv.err.orig, 2, mean)
+
+print(c("Output = ", numbers))
+
+# Convert to a single string with tab as delimiter
+numbers_string <- paste(numbers, collapse = "\t")
+
+# Copy to clipboard
+writeClipboard(numbers_string)
+
+```
+
+
+## 10.3. performance Tomek
+```{r}
+set.seed(my.seed)
+folds = sample(1:k, nrow(dat), replace = TRUE)
+cv.err.tomek = matrix(NA, nrow = k, ncol = 7)
+cv.count = 0
+
+for (j in 1:loop.k) {
+# for (j in 1:1) {
+  cv.count = cv.count + 1
+  train_full = dat[folds != j,]
+  test = dat[folds == j,]
+  
+  # using "drop = FALSE" to enforce "X_train_full" 
+  # to be data.frame not vector
+  X_train_full = train_full[, 1:(ncol(train_full)-1), drop = FALSE]
+  y_train_full = train_full[,ncol(train_full)]
+  X_test = test[,1:(ncol(test)-1)]
+  y_test = test[,ncol(train_full)]
+  
+  dat.tomek = ubTomek(X = X_train_full, Y = y_train_full)
+  
+  if (comp.selection == 1) {
+    print("gam is used")
+    perf.out.tomek = gam.perf(dat.tomek$X, dat.tomek$Y, X_test, y_test)
+  } else if (comp.selection == 2) {
+    print("glm is used")
+    perf.out.tomek = glm.perf(dat.tomek$X, dat.tomek$Y, X_test, y_test)  
+  } else if (comp.selection == 3) {
+    print("Decision Tree is used")
+    perf.out.tomek = dt.perf(dat.tomek$X, dat.tomek$Y, X_test, y_test) 
+  } else if (comp.selection == 4) {
+    print("svm is used")
+    perf.out.tomek = svm.perf(dat.tomek$X, dat.tomek$Y, X_test, y_test) 
+  }
+  
+  cv.err.tomek[j,1] = perf.out.tomek[[1]]
+  cv.err.tomek[j,2] = perf.out.tomek[[2]]
+  cv.err.tomek[j,3] = perf.out.tomek[[3]]
+  cv.err.tomek[j,4] = perf.out.tomek[[4]]
+  cv.err.tomek[j,5] = perf.out.tomek[[5]]
+  cv.err.tomek[j,6] = perf.out.tomek[[6]]
+  cv.err.tomek[j,7] = perf.out.tomek[[7]]
+}
+
+numbers = cv.err.tomek.mean = apply(cv.err.tomek, 2, mean)
+
+print(c("Output = ", numbers))
+
+# Convert to a single string with tab as delimiter
+numbers_string <- paste(numbers, collapse = "\t")
+
+# Copy to clipboard
+writeClipboard(numbers_string)
+
+length(dat.tomek$X)
+```
+
+
+## 10.4. performance NCL (not working)
+
+## 10.5. performance SMOTE
+```{r}
+# my.seed = 2
+set.seed(my.seed)
+folds = sample(1:loop.k, nrow(dat), replace = TRUE)
+cv.err.SMOTE = matrix(NA, nrow = k, ncol = 7)
+cv.count = 0
+
+for (j in 1:k) {
+# for (j in 1:1) {
+  cv.count = cv.count + 1
+  train_full = dat[folds != j,]
+  test = dat[folds == j,]
+  
+  X_train_full = train_full[, 1:(ncol(train_full)-1), drop = FALSE]
+  y_train_full = train_full[,ncol(train_full)]
+  X_test = test[,1:(ncol(test)-1)]
+  y_test = test[,ncol(train_full)]
+  
+  y_train_full_factor = as.factor(y_train_full)
+  dat.SMOTE = ubSMOTE(X = X_train_full, Y = y_train_full_factor)
+  
+  X_train = as.integer(dat.SMOTE$X)
+  y_train = as.integer(dat.SMOTE$Y) - 1
+  
+  if (comp.selection == 1) {
+    print("gam is used")
+    perf.out.SMOTE = gam.perf(dat.SMOTE$X, dat.SMOTE$Y, X_test, y_test)
+  } else if (comp.selection == 2) {
+    print("glm is used")
+    perf.out.SMOTE = glm.perf(dat.SMOTE$X, dat.SMOTE$Y, X_test, y_test)  
+  } else if (comp.selection == 3) {
+    print("Decision Tree is used")
+    perf.out.SMOTE = dt.perf(dat.SMOTE$X, dat.SMOTE$Y, X_test, y_test) 
+  } else if (comp.selection == 4) {
+    print("svm is used")
+    perf.out.SMOTE = svm.perf(X_train, y_train, X_test, y_test) 
+  }
+
+  cv.err.SMOTE[j,1] = perf.out.SMOTE[[1]]
+  cv.err.SMOTE[j,2] = perf.out.SMOTE[[2]]
+  cv.err.SMOTE[j,3] = perf.out.SMOTE[[3]]
+  cv.err.SMOTE[j,4] = perf.out.SMOTE[[4]]
+  cv.err.SMOTE[j,5] = perf.out.SMOTE[[5]]
+  cv.err.SMOTE[j,6] = perf.out.SMOTE[[6]]
+  cv.err.SMOTE[j,7] = perf.out.SMOTE[[7]]
+}
+
+numbers = cv.err.SMOTE.mean = apply(cv.err.SMOTE, 2, mean)
+
+print(c("Output = ", numbers))
+
+# Convert to a single string with tab as delimiter
+numbers_string <- paste(numbers, collapse = "\t")
+
+# Copy to clipboard
+writeClipboard(numbers_string)
+length(dat.SMOTE$X)
+```
+
+
+## 10.10. performance Random downsampling
+
+```{r}
+# my.seed = 1
+set.seed(my.seed)
+folds = sample(1:loop.k, nrow(dat), replace = TRUE)
+cv.err.Under = matrix(NA, nrow = k, ncol = 7)
+cv.count = 0
+
+for (j in 1:k) {
+# for (j in 1:1) {
+  cv.count = cv.count + 1
+  train_full = dat[folds != j,]
+  test = dat[folds == j,]
+  
+  X_train_full = train_full[, 1:(ncol(train_full)-1), drop = FALSE]
+  y_train_full = train_full[,ncol(train_full)]
+  X_test = test[,1:(ncol(test)-1)]
+  y_test = test[,ncol(train_full)]
+  
+  y_train_full_factor = as.factor(y_train_full)
+  
+  min_perc <- (table(y_train_full)[2] / length(y_train_full)) * 100
+  min_perc
+  
+  dat.Under = ubUnder(X = X_train_full, Y = y_train_full, perc = 20, method = "percPos")
+  
+  
+  if (comp.selection == 1) {
+    print("gam is used")
+    perf.out.Under = gam.perf(dat.Under$X, dat.Under$Y, X_test, y_test)
+  } else if (comp.selection == 2) {
+    print("glm is used")
+    perf.out.Under = glm.perf(dat.Under$X, dat.Under$Y, X_test, y_test)  
+  } else if (comp.selection == 3) {
+    print("Decision Tree is used")
+    perf.out.Under = dt.perf(dat.Under$X, dat.Under$Y, X_test, y_test) 
+  } else if (comp.selection == 4) {
+    print("svm is used")
+    perf.out.Under = svm.perf(dat.Under$X, dat.Under$Y, X_test, y_test) 
+  }
+  
+  cv.err.Under[j,1] = perf.out.Under[[1]]
+  cv.err.Under[j,2] = perf.out.Under[[2]]
+  cv.err.Under[j,3] = perf.out.Under[[3]]
+  cv.err.Under[j,4] = perf.out.Under[[4]]
+  cv.err.Under[j,5] = perf.out.Under[[5]]
+  cv.err.Under[j,6] = perf.out.Under[[6]]
+  cv.err.Under[j,7] = perf.out.Under[[7]]
+}
+
+numbers = cv.err.Under.mean = apply(cv.err.Under, 2, mean)
+
+print(c("Output = ", numbers))
+
+# Convert to a single string with tab as delimiter
+numbers_string <- paste(numbers, collapse = "\t")
+
+# Copy to clipboard
+writeClipboard(numbers_string)
+
+length(dat.Under$X)
+```
+
+
+## 10.11. performance Random oversampling
+
+```{r}
+# my.seed = 1
+set.seed(my.seed)
+folds = sample(1:loop.k, nrow(dat), replace = TRUE)
+cv.err.Over = matrix(NA, nrow = k, ncol = 7)
+cv.count = 0
+
+for (j in 1:k) {
+# for (j in 1:1) {
+  cv.count = cv.count + 1
+  train_full = dat[folds != j,]
+  test = dat[folds == j,]
+  
+  X_train_full = train_full[, 1:(ncol(train_full)-1), drop = FALSE]
+  y_train_full = train_full[,ncol(train_full)]
+  X_test = test[,1:(ncol(test)-1)]
+  y_test = test[,ncol(train_full)]
+  
+  y_train_full_factor = as.factor(y_train_full)
+  
+  dat.Over = ubOver(X = X_train_full, Y = y_train_full, k = 1.5)
+  
+  
+  
+  if (comp.selection == 1) {
+    print("gam is used")
+    perf.out.Over = gam.perf(dat.Over$X, dat.Over$Y, X_test, y_test)
+  } else if (comp.selection == 2) {
+    print("glm is used")
+    perf.out.Over = glm.perf(dat.Over$X, dat.Over$Y, X_test, y_test)  
+  } else if (comp.selection == 3) {
+    print("Decision Tree is used")
+    perf.out.Over = dt.perf(dat.Over$X, dat.Over$Y, X_test, y_test) 
+  } else if (comp.selection == 4) {
+    print("svm is used")
+    perf.out.Over = svm.perf(dat.Over$X, dat.Over$Y, X_test, y_test) 
+  }
+  
+  cv.err.Over[j,1] = perf.out.Over[[1]]
+  cv.err.Over[j,2] = perf.out.Over[[2]]
+  cv.err.Over[j,3] = perf.out.Over[[3]]
+  cv.err.Over[j,4] = perf.out.Over[[4]]
+  cv.err.Over[j,5] = perf.out.Over[[5]]
+  cv.err.Over[j,6] = perf.out.Over[[6]]
+  cv.err.Over[j,7] = perf.out.Over[[7]]
+}
+
+numbers = cv.err.Over.mean = apply(cv.err.Over, 2, mean)
+
+print(c("Output = ", numbers))
+
+# Convert to a single string with tab as delimiter
+numbers_string <- paste(numbers, collapse = "\t")
+
+# Copy to clipboard
+writeClipboard(numbers_string)
+
+length(dat.Over$X)
+```
+
+
+### Find the number of training data based on the 10-CV
+
+```{r}
+# Calculate the lengths
+length_dat_orig <- length(dat.orig)
+length_dat_tomek <- length(dat.tomek$X)
+# length_dat_NCL <- length(dat.NCL$X) # Uncomment if needed
+length_dat_SMOTE <- length(dat.SMOTE$X)
+length_dat_Under <- length(dat.Under$X)
+length_dat_Over <- length(dat.Over$X)
+idx_max_value <- idx_max + initial_k
+
+# Use cat() to print all values in a newline-separated format
+cat(length_dat_orig, length_dat_tomek, length_dat_SMOTE, length_dat_Under, length_dat_Over, idx_max_value, sep = "\n")
+
+
+# Prepare the string with newline characters
+output_values <- paste(length_dat_orig, length_dat_tomek, length_dat_SMOTE, length_dat_Under, length_dat_Over, idx_max_value, sep = "\n")
+
+# Copy to clipboard (Windows-specific)
+writeClipboard(output_values)
+
+```
+
+
+
+##########################
+# 20. Box-plot for 10-CV #
+##########################
+
+## 20-1. Synthetic dataset
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1552-1.RData")
+
+cv.err.orig.syn1 = cv.err.orig
+cv.err.tomek.syn1 = cv.err.tomek
+cv.err.SMOTE.syn1 = cv.err.SMOTE
+cv.err.Under.syn1 = cv.err.Under
+cv.err.Over.syn1 = cv.err.Over
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1552.RData")
+
+str(error.test.active) # [1:401, 1:5]
+
+str(cv.active.out[[1]][[1]]) # [1:400, 1:5]
+# cv.active.out[[1]][[1]] #1-CV, 5 columns error matrix
+# I would like to choose F-measure(2nd column) at 93th value
+
+cv.err.active.syn1 = matrix(NA, nrow = 5, ncol = 5)
+for (j in 1:5) {
+  for (i in 1:5) {
+      cv.err.active.syn1[j,i] = cv.active.out[[j]][[1]][(18-1),i]    
+  }
+  
+}
+
+round(colMeans(cv.err.orig.syn1),3)
+round(colMeans(cv.err.tomek.syn1),3)
+round(colMeans(cv.err.SMOTE.syn1),3)
+round(colMeans(cv.err.Under.syn1),3)
+round(colMeans(cv.err.Over.syn1),3)
+round(apply(cv.err.active.syn1, 2, mean),3) # check to see if result is the same in the excel
+
+```
+
+
+## 20-2. HadCRUT dataset
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1652-1.RData")
+
+
+cv.err.orig.syn2 = cv.err.orig
+cv.err.tomek.syn2 = cv.err.tomek
+cv.err.SMOTE.syn2 = cv.err.SMOTE
+cv.err.Under.syn2 = cv.err.Under
+cv.err.Over.syn2 = cv.err.Over
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1652.RData")
+
+str(error.test.active) # [1:401, 1:5]
+
+str(cv.active.out[[1]][[1]]) # [1:400, 1:5]
+# cv.active.out[[1]][[1]] #1-CV, 5 columns error matrix
+# I would like to choose F-measure(2nd column) at 93th value
+
+cv.err.active.syn2 = matrix(NA, nrow = 5, ncol = 5)
+for (j in 1:5) {
+  for (i in 1:5) {
+      cv.err.active.syn2[j,i] = cv.active.out[[j]][[1]][(297-1),i]    
+  }
+  
+}
+
+round(colMeans(cv.err.orig.syn2),3)
+round(colMeans(cv.err.tomek.syn2),3)
+round(colMeans(cv.err.SMOTE.syn2),3)
+round(colMeans(cv.err.Under.syn2),3)
+round(colMeans(cv.err.Over.syn2),3)
+round(apply(cv.err.active.syn2, 2, mean),3) # check to see if result is the same in the excel
+```
+
+
+
+## 20-3. South Africa
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1752-1.RData")
+
+
+cv.err.orig.syn3 = cv.err.orig
+cv.err.tomek.syn3 = cv.err.tomek
+cv.err.SMOTE.syn3 = cv.err.SMOTE
+cv.err.Under.syn3 = cv.err.Under
+cv.err.Over.syn3 = cv.err.Over
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1752.RData")
+
+str(error.test.active) # [1:401, 1:5]
+
+str(cv.active.out[[1]][[1]]) # [1:400, 1:5]
+# cv.active.out[[1]][[1]] #1-CV, 5 columns error matrix
+# I would like to choose F-measure(2nd column) at 93th value
+
+cv.err.active.syn3 = matrix(NA, nrow = 5, ncol = 5)
+for (j in 1:5) {
+  for (i in 1:5) {
+      cv.err.active.syn3[j,i] = cv.active.out[[j]][[1]][(297-1),i]    
+  }
+  
+}
+
+round(colMeans(cv.err.orig.syn3),3)
+round(colMeans(cv.err.tomek.syn3),3)
+round(colMeans(cv.err.SMOTE.syn3),3)
+round(colMeans(cv.err.Under.syn3),3)
+round(colMeans(cv.err.Over.syn3),3)
+round(apply(cv.err.active.syn3, 2, mean),3) # check to see if result is the same in the excel
+```
+
+## 20-4. Pima
+```{r}
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1952-1.RData")
+
+
+cv.err.orig.syn4 = cv.err.orig
+cv.err.tomek.syn4 = cv.err.tomek
+cv.err.SMOTE.syn4 = cv.err.SMOTE
+cv.err.Under.syn4 = cv.err.Under
+cv.err.Over.syn4 = cv.err.Over
+
+load("C:/Users/wonjae.lee/OneDrive - Francis Marion University/01_Research/01_Paper (Publication)/06_R_2 (Nonparametric)/Archive/case1952.RData")
+
+str(error.test.active) # [1:401, 1:5]
+
+str(cv.active.out[[1]][[1]]) # [1:400, 1:5]
+# cv.active.out[[1]][[1]] #1-CV, 5 columns error matrix
+# I would like to choose F-measure(2nd column) at 93th value
+
+cv.err.active.syn4 = matrix(NA, nrow = 5, ncol = 5)
+for (j in 1:5) {
+  for (i in 1:5) {
+      cv.err.active.syn4[j,i] = cv.active.out[[j]][[1]][(297-1),i]    
+  }
+  
+}
+
+round(colMeans(cv.err.orig.syn4),3)
+round(colMeans(cv.err.tomek.syn4),3)
+round(colMeans(cv.err.SMOTE.syn4),3)
+round(colMeans(cv.err.Under.syn4),3)
+round(colMeans(cv.err.Over.syn4),3)
+round(apply(cv.err.active.syn4, 2, mean),3) # check to see if result is the same in the excel
+```
+
+## 20-6. Plotting box-plot
+
+```{r}
+# creating data set for f-measure
+f1 = c(cv.err.orig.syn1[,2], 
+       cv.err.Under.syn1[,2], 
+       cv.err.Over.syn1[,2],
+       cv.err.tomek.syn1[,2], 
+       cv.err.SMOTE.syn1[,2], 
+       cv.err.active.syn1[,2])
+
+f2 = c(cv.err.orig.syn2[,2], 
+       cv.err.Under.syn2[,2], 
+       cv.err.Over.syn2[,2], 
+       cv.err.tomek.syn2[,2], 
+       cv.err.SMOTE.syn2[,2], 
+       cv.err.active.syn2[,2])
+
+f3 = c(cv.err.orig.syn3[,2], 
+       cv.err.Under.syn3[,2],
+       cv.err.Over.syn3[,2], 
+       cv.err.tomek.syn3[,2], 
+       cv.err.SMOTE.syn3[,2], 
+       cv.err.active.syn3[,2])
+
+f4 = c(cv.err.orig.syn4[,2], 
+       cv.err.Under.syn4[,2], 
+       cv.err.Over.syn4[,2], 
+       cv.err.tomek.syn4[,2], 
+       cv.err.SMOTE.syn4[,2], 
+       cv.err.active.syn4[,2])
+
+f5 = (f1 + f2 + f3 + f4)/4
+
+type = c(rep("No-resample", 5), 
+         rep("Down", 5), 
+         rep("Over", 5),
+         rep("TL", 5), 
+         rep("SMOTE", 5), 
+         rep("PbAL", 5))
+
+type = factor(type, levels = c("No-resample", "Down", "Over", "TL", "SMOTE",  "PbAL"), ordered = TRUE)
+
+dat1 = data.frame("fmeasure" = f1, "method" = type)
+dat2 = data.frame("fmeasure" = f2, "method" = type)
+dat3 = data.frame("fmeasure" = f3, "method" = type)
+dat4 = data.frame("fmeasure" = f4, "method" = type)
+dat5 = data.frame("fmeasure" = f5, "method" = type)
+
+
+pdf(file = "boxplot-1.pdf")
+ggplot(dat1, aes(x = method, y = fmeasure, fill = method)) +
+  geom_boxplot(alpha=0.5, width=0.3) + 
+  ggtitle("Syntehtic dataset (IR = 4.8)")+
+  xlab("Resampling techniques") + ylab("F-measure") +
+  geom_jitter(width = 0) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+dev.off()
+
+pdf(file = "boxplot-2.pdf")
+ggplot(dat2, aes(x = method, y = fmeasure, fill = method)) +
+  geom_boxplot(alpha=0.5, width=0.3) + 
+  ggtitle("HadCRUT (IR = 10.2)")+
+  xlab("Resampling techniques") + ylab("F-measure") +
+  geom_jitter(width = 0) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+dev.off()
+
+pdf(file = "boxplot-3.pdf")
+ggplot(dat3, aes(x = method, y = fmeasure, fill = method)) +
+  geom_boxplot(alpha=0.5, width=0.3) + 
+  ggtitle("South Africa (IR = 6.29)")+
+  xlab("Resampling techniques") + ylab("F-measure") +
+  geom_jitter(width = 0) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+dev.off()
+
+pdf(file = "boxplot-4.pdf")
+ggplot(dat4, aes(x = method, y = fmeasure, fill = method)) +
+  geom_boxplot(alpha=0.5, width=0.3) + 
+  ggtitle("Pima (IR = 1.86)")+
+  xlab("Resampling techniques") + ylab("F-measure") +
+  geom_jitter(width = 0) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+dev.off()
+
+pdf(file = "boxplot-5.pdf")
+ggplot(dat5, aes(x = method, y = fmeasure, fill = method)) +
+  geom_boxplot(alpha=0.5, width=0.3) + 
+  # ggtitle("Total")+
+  xlab("Resampling techniques") + ylab("F-measure") +
+  geom_jitter(width = 0) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5))
+dev.off()
+
+```
+
+```{r}
+aov1 = aov(fmeasure ~ method, data = dat1)
+aov2 = aov(fmeasure ~ method, data = dat2)
+aov3 = aov(fmeasure ~ method, data = dat3)
+aov4 = aov(fmeasure ~ method, data = dat4)
+aov5 = aov(fmeasure ~ method, data = dat5)
+
+out1 <- LSD.test(aov1, "method")
+out2 <- LSD.test(aov2, "method")
+out3 <- LSD.test(aov3, "method")
+out4 <- LSD.test(aov4, "method")
+out5 <- LSD.test(aov5, "method")
+
+
+pdf(file = "LSD-1.pdf", width = 8.5, height = 8.5)
+plot(out1, main = "Syntehtic dataset (IR = 4.8)", xlab = "Resampling Techniques", ylab = "F-measure")
+dev.off()
+
+pdf(file = "LSD-2.pdf", width = 8.5, height = 8.5)
+plot(out2, main = "HadCRUT (IR = 10.2)", xlab = "Resampling Techniques", ylab = "F-measure")
+dev.off()
+
+pdf(file = "LSD-3.pdf", width = 8.5, height = 8.5)
+plot(out3, main = "South Africa (IR = 6.29)", xlab = "Resampling Techniques", ylab = "F-measure")
+dev.off()
+
+pdf(file = "LSD-4.pdf", width = 8.5, height = 8.5)
+plot(out4, main = "Pima (IR = 1.86)", xlab = "Resampling Techniques", ylab = "F-measure")
+dev.off()
+
+
+pdf(file = "LSD-5.pdf", width = 8.5, height = 8.5)
+par(mar = c(5, 4, 0, 2))  # Adjust the top margin (third value) to reduce space
+plot(out5, xlab = "Resampling Techniques", ylab = "F-measure", cex.lab = 1.2, main = "")
+dev.off()
+
+```
+
+
+
+
